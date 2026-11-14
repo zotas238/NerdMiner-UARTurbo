@@ -40,11 +40,11 @@ pin)
   ;;
 oc|mhz)
   case "${2:-}" in
-    240) d=8 m=0 ;; 260) d=9 m=20 ;; 280) d=10 m=20 ;; 300) d=11 m=48 ;;
+    240) d=8 m=0 v=0 ;; 260) d=9 m=48 v=0 ;; 280) d=10 m=48 v=0 ;; 300) d=11 m=48 v=0 ;; 320) d=12 m=112 v=30 ;;
     "") cat "$STATE/oc.json" 2>/dev/null || echo '{"div": 8, "mode": 0}'; exit 0 ;;
-    *) echo "usage: nerd-wired mhz 240|260|280|300"; exit 2 ;;
+    *) echo "usage: nerd-wired mhz 240|260|280|300|320"; exit 2 ;;
   esac
-  printf '{"div": %s, "mode": %s}\n' $d $m > "$STATE/oc.json.tmp" && mv "$STATE/oc.json.tmp" "$STATE/oc.json"
+  printf '{"div": %s, "mode": %s, "vdig": %s}\n' $d $m $v > "$STATE/oc.json.tmp" && mv "$STATE/oc.json.tmp" "$STATE/oc.json"
   id nerdminer >/dev/null 2>&1 && chown nerdminer "$STATE/oc.json" 2>/dev/null || true
   send R; echo "saved ${2} MHz; rebooting the board, the relay applies it 30 s after the board's hello"
   ;;
@@ -62,7 +62,7 @@ nerd-wired check           test the wire both ways (pauses the relay a few secon
 nerd-wired check --loopback   test the USB-UART adapter alone (jumper its TXD to RXD)
 nerd-wired ports           USB-UART adapters this computer sees, and what --port auto picks
 sudo nerd-wired pin [dev]  name the adapter /dev/nerdminer (udev), so it survives replugs/renumbering
-nerd-wired mhz [240|260|280|300]   show / set the overclock (reboots the board)
+nerd-wired mhz [240|260|280|300|320]   show / set the overclock (reboots the board)
 nerd-wired ota FILE.bin    update the board's firmware over the wire (*_firmware.bin)
 nerd-wired reboot          reboot the board          nerd-wired voltage [n]   read/set core voltage code
 nerd-wired unsafe          clear the crash guard     nerd-wired cmd <X ...>   raw relay command

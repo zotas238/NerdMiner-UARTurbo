@@ -8,7 +8,7 @@
 #   --password P       pool password (default x)
 #   --port auto|DEV    auto (default): /dev/nerdminer, else the one USB-UART adapter plugged in.
 #                      A header UART needs its device, e.g. /dev/ttyAMA0 (Pi) or /dev/ttyS3 (Orange Pi 5).
-#   --mhz 240|260|280|300   CPU clock to apply after every boot of the board (default 240 = stock, no overclock)
+#   --mhz 240|260|280|300|320   CPU clock to apply after every boot of the board (default 240 = stock, no overclock)
 #   --no-start         install and enable, but don't start it now
 #   --uninstall        remove everything this script installed (keeps /var/lib/nerd-wired unless --purge)
 #
@@ -58,8 +58,9 @@ fi
 [ -n "$POOL" ] && [ -n "$USER_" ] || { echo "--pool and --user are required (see --help)" >&2; exit 2; }
 case "$POOL" in *:[0-9]*) ;; *) echo "--pool must be host:port" >&2; exit 2 ;; esac
 case "${MHZ:-240}" in
-  240) DIV=8 MODE=0 ;; 260) DIV=9 MODE=20 ;; 280) DIV=10 MODE=20 ;; 300) DIV=11 MODE=48 ;;
-  *) echo "--mhz must be 240, 260, 280 or 300" >&2; exit 2 ;;
+  240) DIV=8 MODE=0 VDIG=0 ;; 260) DIV=9 MODE=48 VDIG=0 ;; 280) DIV=10 MODE=48 VDIG=0 ;; 300) DIV=11 MODE=48 VDIG=0 ;;
+  320) DIV=12 MODE=112 VDIG=30 ;;
+  *) echo "--mhz must be 240, 260, 280, 300 or 320" >&2; exit 2 ;;
 esac
 
 # 1. Python 3.8+ and pyserial, from the distro's packages (no pip into the system Python)
@@ -96,7 +97,7 @@ for g in dialout uucp tty; do   # whichever owns /dev/ttyUSB* / ttyS* on this di
   fi
 done
 mkdir -p "$STATE"
-[ -f "$STATE/oc.json" ] && [ -z "$MHZ" ] || printf '{"div": %s, "mode": %s}\n' "$DIV" "$MODE" > "$STATE/oc.json"
+[ -f "$STATE/oc.json" ] && [ -z "$MHZ" ] || printf '{"div": %s, "mode": %s, "vdig": %s}\n' "$DIV" "$MODE" "$VDIG" > "$STATE/oc.json"
 chown -R "$SVC_USER" "$STATE"
 
 # 4. config

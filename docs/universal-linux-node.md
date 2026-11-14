@@ -2,12 +2,12 @@
 
 This guide turns **any Linux computer with a free USB-A port** into the host of a wired, overclocked
 LilyGo T-Display S3 NerdMiner: a desktop, a laptop, a NAS, a mini PC, a Raspberry Pi, an Orange Pi,
-an old thin client... The board runs with Wi-Fi off at up to **300 MHz (~700 kH/s)**. A three-wire link
+an old thin client... The board runs with Wi-Fi off at up to **320 MHz (~737 kH/s)**. A three-wire link
 carries the work from the computer to the board and the shares back.
 
 ```
   pool  <-- internet -->  Linux node  ==USB-A==  [USB-UART bridge]  --3 wires-->  T-Display S3
-                          (nerd-wired relay)        (CP2102/FT232/CH340)  G 43 44   (Wi-Fi off, 300 MHz)
+                          (nerd-wired relay)        (CP2102/FT232/CH340)  G 43 44   (Wi-Fi off, 320 MHz)
                                                                           ^
                                                      board power: its own USB-C, from a phone charger
 ```
@@ -187,25 +187,29 @@ nerd-wired status     # hashrate, clock, accepted / rejected / bad shares
 nerd-wired log        # follow the relay
 ```
 
-Expect ~485 kH/s or more at stock 240 MHz within a minute, and the first accepted shares soon after.
+Expect ~553 kH/s at stock 240 MHz within a minute, and the first accepted shares soon after.
 
 ### 6. Overclock (optional)
 
 ```bash
-nerd-wired mhz 300    # or 260 / 280; 240 = stock
+nerd-wired mhz 300    # or 260 / 280 / 320; 240 = stock
 ```
 
 The setting is saved (`/var/lib/nerd-wired/oc.json`) and applied 30 s after every boot of the board. Go up a
-step at a time, and watch `nerd-wired status` for 15 minutes at each one: **bad must stay 0**. Two crashes at a
-setting within an hour make the relay step down by itself. See the main README for the mode bits, voltage
-and safety nets.
+step at a time, and watch `nerd-wired status` for 15 minutes at each one: **bad must stay 0**. The relay never
+steps the clock down by itself: after a crash the board reboots and the relay re-applies the same setting, so if
+your chip reboots often at a step, go back one step yourself. 320 MHz also raises the core voltage to 30
+(1.25 V, ESP-IDF's own value for 240 MHz); every boot starts at the chip's stock voltage. See the main README
+for how 320 works, the mode bits and the safety nets.
 
 | CPU | Author's T-Display S3 |
 |---|---|
-| 240 MHz (stock) | ~485 kH/s (before Turbo8) |
-| 260 MHz | ~521 kH/s (before Turbo8) |
-| 280 MHz | ~640-646 kH/s |
-| **300 MHz** | **~700 kH/s**, stock voltage, ~34 °C, ~1 crash a day (auto-recovers) |
+| 240 MHz (stock) | ~553 kH/s |
+| 260 MHz | ~599 kH/s |
+| 280 MHz | ~645 kH/s |
+| 300 MHz | ~692 kH/s, stock voltage, ~34 °C, about one crash a day (auto-recovers) |
+| **320 MHz** | **~737 kH/s**, core voltage 30, ~37 °C, 60-min soak with 0 bad and 0 reboots |
+| 340 MHz | not offered: the PLL locks, but the CPU crashes within seconds |
 
 ### 7. Update the firmware later: over the same wire
 
@@ -235,7 +239,7 @@ Each node can host one board per adapter: for several boards, run one relay per 
 | `board -> host: silence` | Board powered? Wired firmware flashed? **43 → RXD** (not TXD)? The joint on **43**. GND. |
 | `board -> host: noise` | GND missing, a 5 V adapter, or the board still running the stock (Wi-Fi) NerdMiner, which logs at 115200. Re-flash step 1. |
 | `host -> board: no reply` | **44 → TXD** and its joint. |
-| status says safe-mode True, ~275 kH/s | The crash guard tripped (overclock too high): lower `nerd-wired mhz`, then `nerd-wired unsafe`. |
+| ~715 kH/s at 320 MHz instead of ~737 | The board crashed once: it then runs one boot without the burst trick (status `t5.sb` code 5). `nerd-wired reboot` brings it back, if the crash was a one-off. |
 | bad > 0, rejected climbing, reboots | Overclock too high for your chip: one step down. |
 | `/dev/nerdminer` missing after moving the adapter | Adapters without a unique serial number (most CH340s) are matched by USB socket: put it back, or run `sudo nerd-wired pin` again. |
 | Board dead or boot-looping | USB recovery: hold BOOT, plug its USB-C into a computer, redo step 1. The ROM bootloader can always be reached. |
@@ -243,6 +247,6 @@ Each node can host one board per adapter: for several boards, run one relay per 
 ## Safety notes
 
 - Only 3.3 V on GPIO43/44. The S3 is not 5 V tolerant.
-- The overclock uses undocumented PLL registers; silicon differs. It's protected by an RTC watchdog, the relay's
-  step-down, the crash guard, and the relay re-hashing every share. But it is still at your own risk.
+- The overclock uses undocumented PLL registers; silicon differs. It's protected by an RTC watchdog (a hang resets
+  the chip, clock and voltage to stock), self-tests against mbedTLS, and the relay re-hashing every share. But it is still at your own risk.
 - Solo mining a T-Display S3 is a lottery ticket, not income.

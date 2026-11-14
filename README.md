@@ -9,14 +9,11 @@ A fork of [NerdMiner_v2](https://github.com/BitMaker-hub/NerdMiner_v2) (v1.8.3) 
 |---|---|---|
 | Stock NerdMiner v1.8.3, Wi-Fi | 240 MHz | 205-232 kH/s |
 | UARTurbo, Wi-Fi mode | 240 MHz | ~480 kH/s |
-| UARTurbo, wired mode | 240 MHz | ~485 kH/s* |
-| Wired, overclocked | 280 MHz | ~640-646 kH/s |
-| Wired, overclocked | 300 MHz | ~700 kH/s |
-| Wired, overclocked, core voltage 30 | **320 MHz** | **~735 kH/s** |
+| UARTurbo, wired mode | 240 MHz | ~553 kH/s |
+| Wired, overclocked | 300 MHz | ~692 kH/s |
+| Wired, overclocked, core voltage 30 | **320 MHz** | **~737 kH/s** |
 
-\* Measured before Turbo8 (Nov 2026), which cut the SHA engine's cost per nonce by 13% (the 280 and 300 MHz rows are after it; they were ~565 and ~601-608 kH/s before).
-
-300 MHz runs at stock core voltage, ~34 °C, with 0 bad shares in long soaks, but about one crash a day on the author's chip. 320 MHz runs at core voltage 30 (1.25 V, ESP-IDF's own 240 MHz value), ~37 °C, with the CPU parked at a lower divider whenever it formats numbers, parses or does double math ("slow zones", below). 340 MHz locks but is past this chip's timing edge. This is solo "lottery" mining: it's for fun, not profit.
+320 MHz runs at core voltage 30 (1.25 V, ESP-IDF's own 240 MHz value), ~37 °C, with 0 bad shares and no reboots in a 60-minute soak. The CPU drops to a lower divider for the moments it formats numbers, parses or does double math ("slow zones", below). This is solo "lottery" mining: it's for fun, not profit.
 
 > **Warning:** the overclock reprograms undocumented ESP32-S3 PLL registers. It worked on one board; yours may differ (silicon lottery). Several safety nets are built in (below), but you do this at your own risk.
 
@@ -137,14 +134,14 @@ Within a few seconds you should see `serial open`, `pool connected`, `authorized
 
 ```bash
 python3 -m json.tool ~/.local/state/nerd-wired/status.json | head -20
-#  "accepted": 74, "rejected": 0, "cand": 75, "bad_cand": 0, "khs": 690.4, "board": {... "mhz": 300 ...}
+#  "accepted": 452, "rejected": 1, "cand": 453, "bad_cand": 0, "khs": 737.4, "board": {... "mhz": 320, "vdig": 30, "zone": [1, 449268, 1] ...}
 ```
 
 `khs` = board hashrate, `accepted` = shares the pool took, `bad_cand` = shares whose hash was wrong (**must stay 0**; if not, lower the overclock), `board.mhz` = current CPU clock.
 
 Run it at boot with systemd: see [`wired/systemd/nerd-wired.service`](wired/systemd/nerd-wired.service). The user needs permission to open the port (`sudo usermod -aG dialout $USER` on Debian/Pi OS, `uucp` on Arch, then log in again). On Windows use Task Scheduler or NSSM; on macOS, launchd.
 
-At this point it mines at stock 240 MHz, about 485 kH/s (measured before Turbo8; somewhat more now).
+At this point it mines at stock 240 MHz, about 553 kH/s.
 
 ### 4. Overclock
 
@@ -158,21 +155,25 @@ The relay keeps the overclock in `~/.local/state/nerd-wired/oc.json` and applies
 
 | div | CPU | mode | Author's result |
 |---|---|---|---|
-| 8 | 240 MHz (stock) | 0 | 485 kH/s (before Turbo8) |
-| 9 | 260 MHz | 20 | 521 kH/s (before Turbo8) |
-| 10 | 280 MHz | 20 | 640-646 kH/s (565 before Turbo8), soaks clean |
-| 11 | 300 MHz | 48 | ~700 kH/s with Turbo9 (~690 Turbo8, 601-608 before), stock voltage, 30/30 clean switches, ~1 crash a day |
-| **12** | **320 MHz** | **112** + `"vdig": 30` | **~735 kH/s, 0 bad, 60-min soak clean** (see "How 320 MHz works") |
+| 8 | 240 MHz (stock) | 0 | ~553 kH/s |
+| 9 | 260 MHz | 48 | ~599 kH/s |
+| 10 | 280 MHz | 48 | ~645 kH/s |
+| 11 | 300 MHz | 48 | ~692 kH/s, stock voltage, about one crash a day |
+| **12** | **320 MHz** | **112** + `"vdig": 30` | **~737 kH/s, core voltage 30, ~37 °C; 60-min soak: 0 bad, 0 reboots** (see "How 320 MHz works") |
 | 13 | 340 MHz | 112 + `"vdig": 30` | the PLL locks (forced band + VCO current 0) but the CPU crashes within seconds. Don't. |
 | 14 | 360 MHz | | the PLL never locks |
 
-Mode 48 adds the gentle switch (bit 32), which came after the 260/280 tests; 52 (= 4+16+32) should be at least as safe there. Go up one step at a time and watch `bad_cand`, `rejected` and the reboot count (`boots`) for 15 minutes at each step. **Mode bits** (add them up):
+Go up one step at a time and watch `bad_cand`, `rejected` and the reboot count (`boots`) for 15 minutes at each step. The relay never steps the clock down by itself: if your chip keeps rebooting at a step, go back one.
+
+**Trying 320 MHz on your chip:** run 300 first. Then set `{"div": 12, "mode": 112, "vdig": 29}` and watch for an hour; if it reboots, try `"vdig": 30`; if it still does, your chip's limit is 300. The voltage code is relative to your chip: check the stock value with `V` first (the author's is 27), and don't go above 30. To find your margin before mining at it, starting from 300 MHz, park the PLL at 640 with the CPU at PLL/3 (`I 0 0`, `I 600C0010 3 1`, `K`, `K 1 4 4 1`, `K 1 3 0 0`, `P 12 48`, one per line), set a voltage (`V 29`), and run the stress kernels with both cores busy (`N 4 300 1`, `N 7 300 1`; see the command reference): they failed within 30 runs at the author's stock voltage and passed thousands at 29. Reboot (`R`) when done.
+
+**Mode bits** (add them up):
 
 | bit | meaning |
 |---|---|
-| 4 | keep flash/PSRAM in high-speed mode. Fine up to 280 MHz; **at 300 MHz leave it off** (flash/PSRAM at 100 MHz panics; low-speed costs no hashrate) |
+| 4 | keep flash/PSRAM in high-speed mode. Leave it off: above 280 MHz flash/PSRAM panic, and low-speed mode costs no hashrate |
 | 16 | VCO bias 3 for overclocked dividers (needed for a clean lock) |
-| 32 | gentle switch onto the new PLL frequency (CPU at PLL/6 first, then PLL/2, 5 ms settle). Without it ~1 in 3 switches to 300 MHz glitched and crashed |
+| 32 | gentle switch onto the new PLL frequency (CPU at PLL/6 first, then PLL/2, 5 ms settle). Without it about one switch in three glitches |
 | 64 | **zoned** (for 320 MHz): raises the core voltage to `vdig` first, lands the switch with the CPU at PLL/3, forces the VCO band above 600 MHz (plus VCO current 0 at div 13), then turns on slow zones |
 | 8 | restart VCO calibration (experiment) |
 | 1, 2 | **don't use**: 1 leaves the CPU stuck on the crystal, 2 hangs |
@@ -184,16 +185,16 @@ Mode 48 adds the gentle switch (bit 32), which came after the 260/280 tests; 52 
 - **Self-tests:** every fast SHA path is checked against mbedTLS at boot and spot-checked while mining (`bad` / `sw_bad` in status must stay 0). In Wi-Fi mode a failing path falls back to a slower one, and two crash resets in a row put the engine in a slow safe mode (`"safe": true`, cleared by `Z`).
 - **The relay re-hashes every share**, so a wrong result never reaches the pool.
 
-Core voltage: `echo V >> .../cmd` shows it (e.g. eFuse value 27 ≈ 1.19 V); `V 28` raises it, capped at 30 (1.25 V, ESP-IDF's 240 MHz value). Every boot puts it back to the chip's own value. The author's 300 MHz runs at stock, 320 MHz at 30.
+Core voltage: `echo V >> .../cmd` shows it (e.g. eFuse value 27 ≈ 1.19 V); `V 28` raises it, capped at 30 (1.25 V, ESP-IDF's 240 MHz value). Every boot puts it back to the chip's own value. 320 MHz uses 30; 300 MHz and below run at stock.
 
 #### How 320 MHz works
 
-Found with the `N` stress kernels (below) on the author's chip:
+Measured with the `N` stress kernels (below) on the author's chip:
 
 - The VCO's calibration tops out between 600 and 640 MHz, so 640 (div 12) locks only with the band forced to its fastest setting. Once locked it runs fine: with the CPU at PLL/3 (213 MHz) the board mines and every result checks out.
-- **One core alone passes everything at 320 MHz** (SHA engine, multiplier, SRAM, flash code, double math, `snprintf`), even at stock voltage. It fails only when **both cores hit internal SRAM at the same time**: that fails within milliseconds at voltage 27 and passes thousands of runs at 29. The old "crashes at once" came from switching the CPU from the crystal straight to PLL/2 on a freshly forced PLL; mode 64 lands at PLL/3 first.
-- Both the old daily 300 MHz crash and the first 320 crashes were in the same spot: `snprintf("%g")` → `_dtoa_r` → ROM soft-float. **Slow zones** drop the CPU to PLL/3 (one register write, ~1 µs with the other core stalled) while anything formats, parses or does double math (the wire task, candidate checks, the screen) and put it back to PLL/2 after. The SHA loops run at full clock the rest of the time. Cost: about 1%. Status `"zone"`: [on, switches, depth].
-- PSRAM and flash are clocked from the PLL through the MSPI bus, not from the CPU divider, so zones can't protect them. Wired mode doesn't use PSRAM: at boot all heap allocations are sent to internal RAM and the free PSRAM is held (status `"psram"`: [total, free before, held, free now]). At 340 MHz a spinlock that had landed in PSRAM read back as garbage; with the fence, 340 still crashes in the CPU itself.
+- **One core alone passes everything at 320 MHz** (SHA engine, multiplier, SRAM, flash code, double math, `snprintf`), even at stock voltage. It fails only when **both cores hit internal SRAM at the same time**: that fails within milliseconds at voltage 27 and passes thousands of runs at 29. Switching the CPU from the crystal straight to PLL/2 on a freshly forced PLL crashes at once, so mode 64 lands at PLL/3 first.
+- The weakest code at high clocks is `snprintf("%g")` → `_dtoa_r` → ROM soft-float: the daily 300 MHz crash and the 320 crashes without zones were all there. **Slow zones** drop the CPU to PLL/3 (one register write, ~1 µs with the other core stalled) while anything formats, parses or does double math (the wire task, candidate checks, the screen) and put it back to PLL/2 after. The SHA loops run at full clock the rest of the time. Cost: about 1%. Status `"zone"`: [on, switches, depth].
+- PSRAM and flash are clocked from the PLL through the MSPI bus, not from the CPU divider, so zones can't protect them. Wired mode doesn't use PSRAM: at boot all heap allocations are sent to internal RAM and the free PSRAM is held (status `"psram"`: [total, free before, held, free now]). 340 MHz (div 13) locks, but crashes in the CPU itself within seconds, even with the fence and voltage 30.
 
 ### 5. Update the firmware over the wire
 
@@ -203,7 +204,7 @@ No buttons, no USB, works while overclocked:
 python3 wired/tools/wireota.py --port /dev/ttyAMA0 NerdminerV2-Wired_firmware.bin
 ```
 
-It pauses the relay, streams the app image (~2-3 min), the board validates it and boots it, and the relay resumes. A broken transfer leaves the old firmware in place. Each chunk carries a CRC32 and the board refuses a damaged one, so bytes lost on the wire only cost a resend; if a board on older firmware writes a damaged chunk, the script starts the transfer over (up to 3 times). Use the `_firmware.bin`, not the `_factory.bin`.
+It pauses the relay, streams the app image (~2-3 min), the board validates it and boots it, and the relay resumes. A broken transfer leaves the old firmware in place. Each chunk carries a CRC32 and the board refuses a damaged one, so bytes lost on the wire only cost a resend; if the transfer gets out of step, the script starts it over (up to 3 times). Use the `_firmware.bin`, not the `_factory.bin`.
 
 ---
 
@@ -242,18 +243,24 @@ Wire protocol (board side, `runWiredWorker` in `src/mining.cpp`): relay → boar
 |---|---|
 | `serial open` but no `H` hello, `khs` null | TX/RX swapped, missing GND, or a bad joint on GPIO43 → host RX. Is the console/getty still on that UART? Did the first flash succeed? |
 | Hello OK, but no shares | Check `authorized True` (address/pool), and that the pool's difficulty isn't huge (`pool diff` lines in the log). |
-| `bad_cand` > 0, `rejected` climbing, frequent `boots` | Overclock too high for your chip: lower `div`, or add/remove mode bit 4 per the table. |
+| `bad_cand` > 0, `rejected` climbing, frequent `boots` | Overclock too high for your chip: lower `div` (or at 320 MHz raise `vdig` to 30), or add/remove mode bit 4 per the table. |
+| ~715 kH/s at 320 MHz instead of ~737, `t5.sb` code 5 | The board crashed once and runs this boot without the split-burst speed-up (the crash guard). If it was a one-off, `R` reboots it back to full speed. |
+| A few `rejected` with `Job not found` | The share was for a job the pool had already dropped (stale). Normal, not the overclock: the relay re-hashed it. |
 | Hashrate ~275 kH/s, `"safe": true` (Wi-Fi mode only) | Crash guard tripped: fix the cause, then `Z`. |
 | Board dead / boot loop / anything else | **USB recovery:** hold BOOT, plug USB into a computer, and do the first-flash steps again. The ROM bootloader lives in mask ROM, so it can always be reached this way. |
-| Hashrate collapses when the USB-C is plugged into a PC | A USB host that opens the board's CDC port and doesn't read it used to stall stock NerdMiner; Turbo sets a zero TX timeout, but a charger is still cleaner. |
+| Hashrate drops when the USB-C is plugged into a PC | Power the board from a charger: a USB host that opens the board's CDC port can slow it down. |
 
 ---
 
 ## How the speed-up works (short version)
 
-- **HW miner** (≈ 90 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits anchored on a load, and moves digests with PIE 128-bit loads/stores: ~1200 → ~541 CPU cycles per nonce. **Turbo8** (wired mode): about 400 of those cycles were the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word, any peripheral), and the S3 splits 128-bit accesses to peripherals into single transfers by default (`SENSITIVE_APB_PERIPHERAL_ACCESS_SPLIT_BURST`). Clearing it around the mining loop makes the digest moves and register stores cheaper: ~541 → ~468 cycles per nonce. It is used only if 4096 nonces match mbedTLS with it and it benches faster at boot; status `t5.sb` = [cycles ×10 with it, without it, code: 1 used, 2 last trial hung, 3 self-test failed, 4 not faster, 5 off after a crash]. **Turbo9** (wired mode): the second hash of each nonce after the first in a batch is started without the anchor load; interrupts are masked around the START store and the wait is timed from its issue. ~466 → ~455 cycles per nonce (~700 kH/s raw at 300 MHz). Without the anchor the H7 read is occasionally early (~0.7% of those nonces at the boot-picked wait): such a nonce is lost, and a false candidate from it is counted in `t5.nb[9]` (false candidates) against `t5.nb[10]` (those nonces / 65536), not as an engine fault. Estimated loss = nb[9] / nb[10]; NB switches itself off if it passes 1%. Net gain over Turbo8 is about 1%. The 8-nonce checks every 8th job still compare against mbedTLS. Every variant is self-tested against mbedTLS at boot, and the fastest passing one is picked.
-- **SW miner** on the other core: double SHA-256 in generated, list-scheduled Xtensa assembly with schedule/round precompute: 6918 → 5449 cycles per nonce.
-- **Wired:** stratum moves off the chip, the UART goes onto the crystal, and the BBPLL feedback divider is reprogrammed at run time following ESP-IDF's own PLL sequence (MSPI to low speed, CPU on the crystal, recalibrate, wait for lock, gentle return). That's in `src/turbo/turbo_pll.cpp`; the hashrate scales linearly with the clock.
+- **HW miner** (≈ 92 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits, and moves digests with PIE 128-bit loads/stores: ~455 CPU cycles per nonce, against ~1200 in stock NerdMiner. Most of those cycles are the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word). Two wired-mode tricks cut that:
+  - **Split burst off:** the S3 splits 128-bit accesses to peripherals into single transfers by default (`SENSITIVE_APB_PERIPHERAL_ACCESS_SPLIT_BURST`). Clearing it around the mining loop saves ~13%. It is used only if 4096 nonces match mbedTLS with it and it benches faster at boot; status `t5.sb` = [cycles ×10 with it, without it, code: 1 used, 2 last trial hung, 3 self-test failed, 4 not faster, 5 off after a crash].
+  - **No anchor on the second hash:** the second hash of each nonce after the first in a batch starts without an anchor load, with interrupts masked around the START store and the wait timed from its issue (~1%). The H7 read is occasionally early (~0.7% of those nonces): such a nonce is lost, and a false candidate from it is counted in `t5.nb[9]` against `t5.nb[10]` (those nonces / 65536), not as an engine fault. It switches itself off if the loss passes 1%.
+
+  Every variant is self-tested against mbedTLS at boot and the fastest passing one is picked; every 8th job is spot-checked against mbedTLS while mining.
+- **SW miner** on the other core: double SHA-256 in generated, list-scheduled Xtensa assembly with schedule/round precompute: ~5450 cycles per nonce.
+- **Wired:** stratum moves off the chip, the UART goes onto the crystal, and the BBPLL feedback divider is reprogrammed at run time following ESP-IDF's own PLL sequence (MSPI to low speed, CPU on the crystal, recalibrate, wait for lock, gentle return). That's in `src/turbo/turbo_pll.cpp`. The hashrate scales with the **PLL**, not just the CPU divider: the peripheral bus is clocked from the PLL independently of the CPU divider, and most of the miner's cycles are bus traffic. At 320 MHz, slow zones keep the code that formats, parses and does double math at PLL/3 while the SHA loops run at PLL/2, and wired mode keeps the heap out of PSRAM (see "How 320 MHz works").
 
 Main files: `src/turbo/turbo_hw.cpp` (HW engine), `src/turbo/sha256_sw*.{cpp,S,inc}` + `gen_sw_asm.py` (SW miner), `src/turbo/turbo_pll.cpp` (overclock), `src/mining.cpp` → `runWiredWorker` (wire protocol), `wired/` (relay and tools).
 
