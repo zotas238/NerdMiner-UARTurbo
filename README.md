@@ -207,6 +207,7 @@ Write one per line to `<state>/cmd` (`echo S >> ~/.local/state/nerd-wired/cmd`).
 | `V [n]` | read / set core voltage code (capped at 30) |
 | `Z` | clear the crash guard (Wi-Fi mode's safe mode) and reboot |
 | `W <s>` | screen redraw period in seconds (default 12, `0` = frozen). Status `"redraw"`: [period, last µs, max µs, count] |
+| `L <h> <h>` | block height for the screen (the relay sends it from the job's coinbase, BIP34, when it changes) |
 | `M <d> <d>` | set the best-ever share difficulty shown on the screen (value twice, both must match) |
 | `F` | screenshot: use `wired/tools/screenshot.py out.png` (drops to stock clock for the read-back, restores the overclock) |
 | `Y` | stream the last coredump (use `wired/tools/coredump_get.py <firmware.elf>`) |

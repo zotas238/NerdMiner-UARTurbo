@@ -58,6 +58,10 @@ bool parse_mining_subscribe(String line, mining_subscribe& mSubscribe);
 bool tx_mining_auth(WiFiClient& client, const char * user, const char * pass);
 stratum_method parse_mining_method(String line);
 bool parse_mining_notify(String line, mining_job& mJob);
+//Block height being mined (0 = unknown): from the job's coinbase (BIP34) in Wi-Fi mode,
+//from the relay (L) when wired. Shown on the screen.
+extern volatile uint32_t g_block_height;
+uint32_t coinb1_height(const char *coinb1_hex);
 
 //Method Mining.submit
 bool tx_mining_submit(WiFiClient& client, mining_subscribe mWorker, mining_job mJob, unsigned long nonce, unsigned long &submit_id);

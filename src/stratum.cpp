@@ -165,6 +165,38 @@ stratum_method parse_mining_method(String line)
     return result;
 }
 
+volatile uint32_t g_block_height = 0;
+
+//BIP34: the coinbase scriptSig starts with a push of the block height, little-endian.
+//coinb1 hex = version (8) + input count (2) + prevout (72) + script length (2) + push length (2) + height
+uint32_t coinb1_height(const char *h)
+{
+  auto hexbyte = [](const char *p) -> int {
+    int v = 0;
+    for (int i = 0; i < 2; ++i)
+    {
+      const char c = p[i];
+      v <<= 4;
+      if (c >= '0' && c <= '9') v |= c - '0';
+      else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+      else return -1;
+    }
+    return v;
+  };
+  if (!h || strlen(h) < 94) return 0;
+  const int n = hexbyte(h + 84);
+  if (n < 1 || n > 4) return 0;
+  uint32_t height = 0;
+  for (int i = n - 1; i >= 0; --i)
+  {
+    const int b = hexbyte(h + 86 + 2 * i);
+    if (b < 0) return 0;
+    height = height << 8 | (uint32_t)b;
+  }
+  return height;
+}
+
 bool parse_mining_notify(String line, mining_job& mJob)
 {
     Serial.println("    Parsing Method [MINING NOTIFY]");
@@ -178,6 +210,8 @@ bool parse_mining_notify(String line, mining_job& mJob)
     mJob.job_id = String((const char*) doc["params"][0]);
     mJob.prev_block_hash = String((const char*) doc["params"][1]);
     mJob.coinb1 = String((const char*) doc["params"][2]);
+    if (const uint32_t bh = coinb1_height(mJob.coinb1.c_str()))
+      g_block_height = bh;
     mJob.coinb2 = String((const char*) doc["params"][3]);
     mJob.merkle_branch = doc["params"][4];
     mJob.version = String((const char*) doc["params"][5]);

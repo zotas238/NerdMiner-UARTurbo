@@ -58,6 +58,14 @@ OC_DELAY = 30
 JOB_REFRESH = 30          # s: new extranonce2 / ntime even without a notify
 DIFF1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 
+def coinb1_height(c1):
+    """BIP34 block height from the coinbase's scriptSig (0 if it isn't there)."""
+    try:
+        b = bytes.fromhex(c1); n = b[42]
+        return int.from_bytes(b[43:43 + n], "little") if 1 <= n <= 4 else 0
+    except (ValueError, IndexError):
+        return 0
+
 
 def oc_load():
     try:
@@ -130,7 +138,7 @@ def build_header(n, en1, en2, ntime_hex):
 
 def main():
     pool = Pool(); ser = None; sbuf = b""
-    jobs = {}; next_id = 1; en2_ctr = 0; last_job = 0
+    jobs = {}; next_id = 1; en2_ctr = 0; last_job = 0; height = sent_height = 0
     st = {"accepted": 0, "rejected": 0, "cand": 0, "bad_cand": 0, "stale": 0, "boots": 0,
           "khs": None, "board": None, "last_hello": None, "pll_replies": []}
     prev_t = None
@@ -148,7 +156,7 @@ def main():
                     raise LookupError("--port auto needs nerdport.py next to wired_relay.py; pass --port")
                 else:
                     port = args.port
-                ser = serial.Serial(port, args.baud, timeout=0.05); log("serial open", port); last_job = 0
+                ser = serial.Serial(port, args.baud, timeout=0.05); log("serial open", port); last_job = 0; sent_height = 0
                 oc_at = time.time() + OC_DELAY if oc_load().get("div", 8) != 8 else 0
                 main.last_lookup = None
             if pool.sock is None:
@@ -157,7 +165,7 @@ def main():
             for m in pool.lines():
                 meth = m.get("method")
                 if meth == "mining.notify":
-                    pool.notify = m["params"]; last_job = 0
+                    pool.notify = m["params"]; last_job = 0; height = coinb1_height(m["params"][2]) or height; st["height"] = height
                     if m["params"][8]: jobs.clear()
                 elif meth == "mining.set_difficulty":
                     pool.diff = float(m["params"][0]); log("pool diff", pool.diff)
@@ -216,7 +224,7 @@ def main():
                             st["low_cand"] = st.get("low_cand", 0) + 1; continue
                         pool.pending[pool.submit(job_id, en2, ntime, nonce)] = hd
                     elif l.startswith("H "):
-                        st["boots"] += 1; st["last_hello"] = l; prev_t = None; last_job = 0; log(l)
+                        st["boots"] += 1; st["last_hello"] = l; prev_t = None; last_job = 0; sent_height = 0; log(l)
                         kv = dict(w.split("=", 1) for w in l.split() if "=" in w)
                         c = oc_load()
                         crashed_here = kv.get("last_try") == str(c.get("div")) or (kv.get("last_try") == "0" and time.time() - oc_applied < 600)
@@ -231,6 +239,10 @@ def main():
             if oc_at and time.time() > oc_at and ser:
                 c = oc_load(); oc_at = 0
                 ser.write(("P %d %d\n" % (c["div"], c.get("mode", 0))).encode()); log("overclock: P", c["div"], c.get("mode", 0)); oc_applied = time.time()
+            # block height for the screen, only when it changes (and after a boot / port reopen)
+            if ser and height and height != sent_height:
+                ser.write(("L %d %d\n" % (height, height)).encode()); sent_height = height
+
             # control
             if CMD.exists():
                 cmds = CMD.read_text().split("\n")

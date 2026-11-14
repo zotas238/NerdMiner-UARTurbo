@@ -29,6 +29,7 @@ TFT_eSprite background = TFT_eSprite(&tft); // Invoke library sprite
 extern uint32_t Mhashes;
 extern uint32_t hashes;
 #include "mining.h"
+#include "stratum.h"
 
 //Redraw period in seconds (0 = screen frozen), settable over the wire (W <s>). Each redraw
 //takes CPU time on core 1 from the software miner, so keep it rare.
@@ -124,8 +125,21 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   tft.drawString(line, 8, 88, 4);
   snprintf(line, sizeof(line), "Best session  %s", session);
   tft.drawString(line, 8, 114, 4);
+  tft.setTextPadding(150);
   snprintf(line, sizeof(line), "Temp  %.0f C", temperatureRead());
   tft.drawString(line, 8, 140, 4);
+  //block height, right-aligned on the bottom line; drawn only when it changes (~every 10 min)
+  static uint32_t shown_height = 0;
+  const uint32_t bh = g_block_height;
+  if (bh && bh != shown_height)
+  {
+    shown_height = bh;
+    snprintf(line, sizeof(line), "Block %lu", (unsigned long)bh);
+    tft.setTextPadding(150);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(line, 312, 140, 4);
+    tft.setTextDatum(TL_DATUM);
+  }
 
   const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
   if (s_tft_lock)

@@ -1717,7 +1717,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v9 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v10 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1824,6 +1824,12 @@ void runWiredWorker(void *name)
           {
             uint32_t n = turbo_screen_dump(wired_dump_emit);
             Serial0.printf("f end %u\n", (unsigned)n);
+          }
+          else if (cmd == 0x4C)     // L <height> <height>: block being mined, for the screen (sent on change)
+          {
+            double d;
+            if (wired_twice(line + 2, &d) && d > 0 && d < 1e8)
+              g_block_height = (uint32_t)d;
           }
           else if (cmd == 0x4D)     // M <diff> <diff>: set the best-ever share (e.g. carry it over from the
           {                         // relay's logs, or correct it); both copies must agree
