@@ -1469,6 +1469,7 @@ void runMonitor(void *name)
 #ifdef NM_TURBO
 //One line of JSON for the status port: raw hash counters (rates are computed by the
 //reader from two samples), pool state and the HW self-test results
+bool turboPoolUp();
 String turboStatusJson()
 {
   char hw[640];
@@ -1485,7 +1486,7 @@ String turboStatusJson()
     "}\n",
     (unsigned long)millis(), (unsigned long long)upTime, (unsigned)g_hw_hashes, (unsigned)g_sw_hashes,
     (unsigned)elapsedKHs, (unsigned)shares, (unsigned)valids, best_diff, (unsigned)templates,
-    (client.connected() && isMinerSuscribed) ? "true" : "false", hw,
+    turboPoolUp() ? "true" : "false", hw,
     g_sw_variant >= 0 ? turbo_sw_variants[g_sw_variant].name : "none",
     (unsigned)g_sw_cpn[0], (unsigned)g_sw_cpn[1], (unsigned)g_sw_cpn[2], (unsigned)g_sw_cpn[3], (unsigned)g_sw_cands, (unsigned)g_sw_bad,
     g_wired ? "true" : "false", best_ever, best_session,
