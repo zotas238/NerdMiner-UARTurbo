@@ -41,7 +41,9 @@ String poolAPIUrl;
 void setup_monitor(void){
     /******** TIME ZONE SETTING *****/
 
+#ifndef NM_WIRED
     timeClient.begin();
+#endif
     
     // Adjust offset depending on your zone
     // GMT +2 in seconds (zona horaria de Europa Central)

@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <esp_task_wdt.h>
+#include <esp_timer.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 //#include "ShaTests/nerdSHA256.h"
@@ -18,10 +19,36 @@
 #include <map>
 #include "mbedtls/sha256.h"
 #include "i2c_master.h"
+#include "mining_job.h"
+#ifdef NM_TURBO
+#include "turbo/turbo_hw.h"
+#include "turbo/sha256_sw.h"
+#include "turbo/turbo_probe.h"
+#endif
 
 //10 Jobs per second
 #define NONCE_PER_JOB_SW 4096
 #define NONCE_PER_JOB_HW 16*1024
+
+#ifdef NM_TURBO
+//Deeper HW queue so the HW miner never starves while stratum is busy
+#define HW_QUEUE_DEPTH 8
+//Hashes done by the SW miner (the HW count is in turbo_hw.cpp), for the status port
+volatile uint32_t g_sw_hashes = 0;
+//SW miner: variant in use (turbo/sha256_sw.cpp), cycles per nonce of each (0 = failed
+//its known-answer test), 16-bit candidates checked, and those the reference disagreed with
+volatile int g_sw_variant = -1;
+volatile uint32_t g_asm_chk = 0xFFFFFFFF, g_asm_got = 0, g_asm_want = 0;
+volatile uint32_t g_sw_cpn[TURBO_SW_VARIANTS] = {0};
+volatile uint32_t g_sw_cands = 0;
+volatile uint32_t g_sw_bad = 0;
+//Diagnostics: stratum loop passes, times a miner found its queue empty
+volatile uint32_t g_strat_loops = 0;
+volatile uint32_t g_hw_starved = 0;
+volatile uint32_t g_sw_starved = 0;
+#else
+#define HW_QUEUE_DEPTH 4
+#endif
 
 //#define I2C_SLAVE
 
@@ -139,26 +166,6 @@ bool checkPoolInactivity(unsigned int keepAliveTime, unsigned long inactivityTim
   return false;
 }
 
-struct JobRequest
-{
-  uint32_t id;
-  uint32_t nonce_start;
-  uint32_t nonce_count;
-  double difficulty;
-  uint8_t sha_buffer[128];
-  uint32_t midstate[8];
-  uint32_t bake[16];
-};
-
-struct JobResult
-{
-  uint32_t id;
-  uint32_t nonce;
-  uint32_t nonce_count;
-  double difficulty;
-  uint8_t hash[32];
-};
-
 static std::mutex s_job_mutex;
 std::list<std::shared_ptr<JobRequest>> s_job_request_list_sw;
 #ifdef HARDWARE_SHA265
@@ -250,6 +257,14 @@ void runStratumWorker(void *name) {
   uint32_t nonce_pool = 0;
   uint32_t job_pool = 0xFFFFFFFF;
   uint32_t last_job_time = millis();
+  //Per-template data: written on mining.notify, read again by the refills on later
+  //passes, so they must outlive one pass of the loop
+  uint32_t hw_midstate[8];
+  uint32_t diget_mid[8];
+  uint32_t bake[32];
+  #if defined(CONFIG_IDF_TARGET_ESP32)
+  uint8_t sha_buffer_swap[128];
+  #endif
 
   while(true) {
       
@@ -320,13 +335,6 @@ void runStratumWorker(void *name) {
       }
     }
 
-    uint32_t hw_midstate[8];
-    uint32_t diget_mid[8];
-    uint32_t bake[16];
-    #if defined(CONFIG_IDF_TARGET_ESP32)
-    uint8_t sha_buffer_swap[128];
-    #endif
-
     //Read pending messages from pool
     while(client.connected() && client.available())
     {
@@ -365,7 +373,11 @@ void runStratumWorker(void *name) {
                                           mMiner.bytearray_blockheader[127] = 0x80;
 
                                           nerd_mids(diget_mid, mMiner.bytearray_blockheader);
+                                          #ifdef NM_TURBO
+                                          turbo_sw_bake(diget_mid, mMiner.bytearray_blockheader+64, bake);
+                                          #else
                                           nerd_sha256_bake(diget_mid, mMiner.bytearray_blockheader+64, bake);
+                                          #endif
 
                                           #ifdef HARDWARE_SHA265
                                           #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
@@ -507,6 +519,9 @@ void runStratumWorker(void *name) {
     #else
     vTaskDelay(50 / portTICK_PERIOD_MS); //Small delay
     #endif
+    #ifdef NM_TURBO
+    g_strat_loops++;
+    #endif
 
     
     if (job_pool != 0xFFFFFFFF)
@@ -528,7 +543,7 @@ void runStratumWorker(void *name) {
 #endif
 
       #ifdef HARDWARE_SHA265
-      while (s_job_request_list_hw.size() < 4)
+      while (s_job_request_list_hw.size() < HW_QUEUE_DEPTH)
       {
         #if defined(CONFIG_IDF_TARGET_ESP32)
           JobPush( s_job_request_list_hw, job_pool, nonce_pool, NONCE_PER_JOB_HW, currentPoolDifficulty, sha_buffer_swap, hw_midstate, bake);
@@ -556,12 +571,14 @@ void runStratumWorker(void *name) {
           break;
         unsigned long sumbit_id = 0;
         tx_mining_submit(client, mWorker, mJob, res->nonce, sumbit_id);
+        #ifndef NM_TURBO
         Serial.print("   - Current diff share: "); Serial.println(res->difficulty,12);
         Serial.print("   - Current pool diff : "); Serial.println(currentPoolDifficulty,12);
         Serial.print("   - TX SHARE: ");
         for (size_t i = 0; i < 32; i++)
             Serial.printf("%02x", res->hash[i]);
         Serial.println("");
+        #endif
         mLastTXtoPool = millis();
 
         std::shared_ptr<Submition> submition = std::make_shared<Submition>();
@@ -583,6 +600,46 @@ void runStratumWorker(void *name) {
 
 //////////////////THREAD CALLS///////////////////
 
+#ifdef NM_TURBO
+//Picks the fastest SW double-SHA variant (turbo/sha256_sw.cpp) that passes its
+//known-answer test, timed on this core
+static void turbo_sw_pick()
+{
+  uint8_t hdr[80];
+  for (int i = 0; i < 80; ++i)
+    hdr[i] = (uint8_t)(i * 29 + 5);
+  uint32_t mid[8], bake[TURBO_SW_BAKE_WORDS];
+  nerd_mids(mid, hdr);
+  turbo_sw_bake(mid, hdr + 64, bake);
+  uint8_t hash[32];
+  int best = -1;
+  for (int v = 0; v < TURBO_SW_VARIANTS; ++v)
+  {
+    const TurboSwFn fn = turbo_sw_variants[v].fn;
+    if (!turbo_sw_selftest(fn))
+      continue;
+    uint32_t cpn = 0xFFFFFFFF;
+    for (int r = 0; r < 3; ++r)
+    {
+      const int64_t t0 = esp_timer_get_time();
+      for (uint32_t n = 0; n < 1024; ++n)
+        fn(bake, n, hash);
+      const uint32_t c = (uint32_t)((esp_timer_get_time() - t0) * 240 / 1024);
+      if (c < cpn) cpn = c;
+    }
+    g_sw_cpn[v] = cpn;
+    if (best < 0 || cpn < g_sw_cpn[best])
+      best = v;
+  }
+  g_asm_chk = turbo_sw_asm_check(64, (uint32_t *)&g_asm_got, (uint32_t *)&g_asm_want);
+  if (best >= 0)
+    turbo_sw_hash = turbo_sw_variants[best].fn;
+  g_sw_variant = best;
+  Serial.printf("[MINER] SW sha256d %s: %u / %u / %u / %u cycles per nonce\n", best >= 0 ? turbo_sw_variants[best].name : "none",
+                (unsigned)g_sw_cpn[0], (unsigned)g_sw_cpn[1], (unsigned)g_sw_cpn[2], (unsigned)g_sw_cpn[3]);
+}
+#endif
+
 void minerWorkerSw(void * task_id)
 {
   unsigned int miner_id = (uint32_t)task_id;
@@ -592,6 +649,9 @@ void minerWorkerSw(void * task_id)
   std::shared_ptr<JobResult> result;
   uint8_t hash[32];
   uint32_t wdt_counter = 0;
+  #ifdef NM_TURBO
+  turbo_sw_pick();
+  #endif
   while (1)
   {
     {
@@ -617,11 +677,26 @@ void minerWorkerSw(void * task_id)
       result->id = job->id;
       result->nonce_count = job->nonce_count;
       uint8_t job_in_work = job->id & 0xFF;
+      #ifdef NM_TURBO
+      const TurboSwFn sw_hash = turbo_sw_hash;
+      #endif
       for (uint32_t n = 0; n < job->nonce_count; ++n)
       {
+        #ifdef NM_TURBO
+        if (sw_hash(job->bake, job->nonce_start + n, hash))
+        {
+          //checked against the independent reference before it can become a share
+          g_sw_cands++;
+          if (!turbo_ref_check(job->sha_buffer, job->nonce_start + n, hash))
+          {
+            g_sw_bad++;
+            continue;
+          }
+        #else
         ((uint32_t*)(job->sha_buffer+64+12))[0] = job->nonce_start+n;
         if (nerd_sha256d_baked(job->midstate, job->sha_buffer+64, job->bake, hash))
         {
+        #endif
           double diff_hash = diff_from_target(hash);
           if (diff_hash > result->difficulty)
           {
@@ -637,8 +712,16 @@ void minerWorkerSw(void * task_id)
           break;
         }
       }
+      #ifdef NM_TURBO
+      g_sw_hashes += result->nonce_count;
+      #endif
     } else
+    {
+      #ifdef NM_TURBO
+      g_sw_starved++;
+      #endif
       vTaskDelay(2 / portTICK_PERIOD_MS);
+    }
 
     wdt_counter++;
     if (wdt_counter >= 8)
@@ -778,6 +861,64 @@ static inline void nerd_sha_hal_wait_idle()
     {}
 }
 
+#ifdef NM_TURBO
+
+//The turbo engine lives in turbo/turbo_hw.cpp; this task only moves jobs and results
+void minerWorkerHw(void * task_id)
+{
+  unsigned int miner_id = (uint32_t)task_id;
+  Serial.printf("[MINER] %d Started turbo minerWorkerHw Task on core %d!\n", miner_id, xPortGetCoreID());
+  turbo_hw_init();
+  #ifdef NM_TURBO_PROBES
+  turbo_probe_run();
+  #endif
+
+  std::shared_ptr<JobRequest> job;
+  std::shared_ptr<JobResult> result;
+  uint32_t wdt_counter = 0;
+
+  while (1)
+  {
+    {
+      std::lock_guard<std::mutex> lock(s_job_mutex);
+      if (result)
+      {
+        if (s_job_result_list.size() < 16)
+          s_job_result_list.push_back(result);
+        result.reset();
+      }
+      if (!s_job_request_list_hw.empty())
+      {
+        job = s_job_request_list_hw.front();
+        s_job_request_list_hw.pop_front();
+      } else
+        job.reset();
+    }
+    if (job)
+    {
+      result = std::make_shared<JobResult>();
+      result->id = job->id;
+      result->nonce = 0xFFFFFFFF;
+      result->difficulty = job->difficulty;
+      turbo_hw_job(*job, *result, s_working_current_job_id);
+      g_hw_hashes += result->nonce_count;
+    } else
+    {
+      g_hw_starved++;
+      vTaskDelay(2 / portTICK_PERIOD_MS);
+    }
+
+    wdt_counter++;
+    if (wdt_counter >= 8)
+    {
+      wdt_counter = 0;
+      esp_task_wdt_reset();
+    }
+  }
+}
+
+#else
+
 //#define VALIDATION
 void minerWorkerHw(void * task_id)
 {
@@ -897,6 +1038,8 @@ void minerWorkerHw(void * task_id)
     }
   }
 }
+
+#endif  //NM_TURBO
 
 #endif  //#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
 
@@ -1259,6 +1402,14 @@ void runMonitor(void *name)
       #endif
 
       seconds_elapsed++;
+      #ifdef NM_TURBO
+      static bool stable = false;
+      if (!stable && now_millis > 300000)
+      {
+        stable = true;
+        turbo_crash_guard_stable();
+      }
+      #endif
 
       if(seconds_elapsed % (saveIntervals[currentIntervalIndex]) == 0){
         saveStat();
@@ -1274,3 +1425,405 @@ void runMonitor(void *name)
     frame++;
   }
 }
+
+#ifdef NM_TURBO
+//One line of JSON for the status port: raw hash counters (rates are computed by the
+//reader from two samples), pool state and the HW self-test results
+String turboStatusJson()
+{
+  char hw[640];
+  turbo_hw_status(hw, sizeof(hw));
+  char buf[1400];
+  snprintf(buf, sizeof(buf),
+    "{\"fw\":\"turbo\",\"ms\":%lu,\"up\":%llu,\"hw\":%u,\"sw\":%u,\"khs\":%u,"
+    "\"shares\":%u,\"valids\":%u,\"best\":%.6g,\"templates\":%u,\"pool\":%s,%s,"
+    "\"swv\":\"%s\",\"sw_cpn\":[%u,%u,%u,%u],\"sw_cand\":%u,\"sw_bad\":%u,"
+    "\"loops\":%u,\"hw_starved\":%u,\"sw_starved\":%u,\"temp\":%.1f,\"rssi\":%d,\"heap\":%u,\"asm_chk\":[%u,%u,%u],\"rr\":%d"
+    #ifdef NM_TURBO_PROBES
+    ",\"probe\":%s"
+    #endif
+    "}\n",
+    (unsigned long)millis(), (unsigned long long)upTime, (unsigned)g_hw_hashes, (unsigned)g_sw_hashes,
+    (unsigned)elapsedKHs, (unsigned)shares, (unsigned)valids, best_diff, (unsigned)templates,
+    (client.connected() && isMinerSuscribed) ? "true" : "false", hw,
+    g_sw_variant >= 0 ? turbo_sw_variants[g_sw_variant].name : "none",
+    (unsigned)g_sw_cpn[0], (unsigned)g_sw_cpn[1], (unsigned)g_sw_cpn[2], (unsigned)g_sw_cpn[3], (unsigned)g_sw_cands, (unsigned)g_sw_bad,
+    (unsigned)g_strat_loops, (unsigned)g_hw_starved, (unsigned)g_sw_starved,
+    temperatureRead(), (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), (unsigned)g_asm_chk, (unsigned)g_asm_got, (unsigned)g_asm_want, (int)esp_reset_reason()
+    #ifdef NM_TURBO_PROBES
+    , turbo_probe_json()
+    #endif
+    );
+  return String(buf);
+}
+#endif
+
+#ifdef NM_TURBO
+bool turboPoolUp()
+{
+  return client.connected() && isMinerSuscribed;
+}
+#endif
+
+#ifdef NM_WIRED
+//---------------------------------------------------------------------------------
+//Wired mode: no Wi-Fi. The host relay (wired/relay/wired_relay.py) speaks stratum
+//to the pool and feeds this board over UART0 (GPIO43 TX / GPIO44 RX) at 921600 baud,
+//clocked from the 40 MHz crystal so the link survives a BBPLL overclock.
+//  relay -> board:  J <id> <pool diff> <80-byte header hex>   new work (nonce ignored)
+//                   P <div>   set BBPLL divider (8 = stock 240 MHz)
+//                   A <diff>  a share was accepted        S  status now
+//                   D         reboot into the ROM download mode (flash over the wire)
+//                   R         reboot
+//  board -> relay:  H ...     hello after boot       T {json}  status every 2 s
+//                   N <id> <nonce> <diff>   share candidate     p <div> <ok> <us>
+#include <hal/uart_ll.h>
+#include <soc/rtc_cntl_reg.h>
+#include "turbo/turbo_pll.h"
+#include "turbo/pie_bench.h"
+#include <soc/rtc_cntl_reg.h>
+#include <soc/rtc.h>
+// RTC watchdog, registers direct (the rtc_wdt_* API is not built into this IDF's esp32s3 libs).
+// Clocked from the RTC slow clock (~136 kHz RC), not the PLL. Stage 0 action 4 = full RTC reset.
+#define NM_RTCWDT_KEY 0x50D83AA1
+static void nm_rtcwdt_start(uint32_t ms)
+{
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, NM_RTCWDT_KEY);
+  WRITE_PERI_REG(RTC_CNTL_WDTCONFIG0_REG, 0);
+  WRITE_PERI_REG(RTC_CNTL_WDTCONFIG1_REG, ms * 150);   // slow-clock cycles, ~150 per ms (RC 136-150 kHz)
+  WRITE_PERI_REG(RTC_CNTL_WDTCONFIG0_REG, RTC_CNTL_WDT_EN | (4u << RTC_CNTL_WDT_STG0_S) |
+                 (7u << RTC_CNTL_WDT_SYS_RESET_LENGTH_S) | (7u << RTC_CNTL_WDT_CPU_RESET_LENGTH_S));
+  WRITE_PERI_REG(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
+}
+static inline void nm_rtcwdt_feed()
+{
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, NM_RTCWDT_KEY);
+  WRITE_PERI_REG(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
+}
+void turbo_crash_guard_stable();
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+static esp_ota_handle_t s_ota = 0;
+static const esp_partition_t *s_ota_part = NULL;
+static uint32_t s_ota_size = 0, s_ota_off = 0;
+static char s_ota_sha[65] = "";
+
+#define WIRED_BAUD 921600
+static uint32_t s_wired_id = 0;
+
+static void wired_uart_begin()
+{
+  Serial0.setRxBufferSize(4096);
+  Serial0.begin(WIRED_BAUD, SERIAL_8N1, 44, 43);
+  uart_ll_set_sclk(&UART0, UART_SCLK_XTAL);
+  uart_ll_set_baudrate(&UART0, WIRED_BAUD);
+}
+
+static int hexval(char c)
+{
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;
+  c |= 0x20;
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10;
+  return -1;
+}
+
+static void wired_status()
+{
+  String js = turboStatusJson();
+  js.trim();
+  if (js.endsWith("}"))
+    js.remove(js.length() - 1);
+  Serial0.printf("T %s,\"pll\":%u,\"ref\":%u,\"mhz\":%u,\"vdig\":%u,\"pll_last_try\":%u,\"wired_id\":%u}\n", js.c_str(),
+                 (unsigned)turbo_pll_get(), (unsigned)turbo_pll_ref(), (unsigned)turbo_pll_mhz(), (unsigned)turbo_vdig_get(),
+                 (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id);
+}
+
+//Called first thing in setup(): 300 ms in which a "D" on the wire reboots into the ROM
+//download mode, so a firmware that crashes later in boot can still be reflashed remotely
+void wired_boot_window()
+{
+  wired_uart_begin();
+  Serial0.printf("\nB wired boot window\n");
+  const uint32_t t0 = millis();
+  while (millis() - t0 < 300)
+  {
+    while (Serial0.available())
+      if (Serial0.read() == 0x44)
+      {
+        Serial0.printf("d\n");
+        Serial0.flush();
+        REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+        esp_restart();
+      }
+    delay(5);
+  }
+}
+
+void runWiredWorker(void *name)
+{
+  turbo_pll_boot();
+  // RTC watchdog: clocked from the RTC slow clock, not the PLL, so it still fires when an overclock
+  // has taken the CPU, the task/interrupt watchdogs and the UART down. Full RTC reset (like power-on:
+  // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
+  nm_rtcwdt_start(8000);
+  wired_uart_begin();
+  Serial0.printf("\nH nerdminer-wired v6 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
+                 (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
+
+  double pool_diff = DEFAULT_DIFFICULTY;
+  uint32_t nonce_pool = 0;
+  uint32_t job_pool = 0xFFFFFFFF;
+  uint32_t hw_midstate[8];
+  uint32_t diget_mid[8];
+  uint32_t bake[32];
+  uint8_t header[128];
+  static char line[1200];
+  size_t llen = 0;
+  uint32_t last_status = millis();
+  mMonitor.NerdStatus = NM_Connecting;
+
+  while (true)
+  {
+    while (Serial0.available())
+    {
+      int c = Serial0.read();
+      if (c == 0x0A || c == 0x0D)
+      {
+        line[llen] = 0;
+        if (llen > 0)
+        {
+          char cmd = line[0];
+          if (cmd == 0x4A && llen > 160)   // J
+          {
+            char *p = line + 2;
+            uint32_t id = strtoul(p, &p, 10);
+            double diff = strtod(p, &p);
+            while (*p == 0x20) p++;
+            bool ok = strlen(p) >= 160;
+            for (int i = 0; ok && i < 80; ++i)
+            {
+              int hi = hexval(p[2 * i]), lo = hexval(p[2 * i + 1]);
+              if (hi < 0 || lo < 0) ok = false;
+              else header[i] = (uint8_t)(hi << 4 | lo);
+            }
+            if (ok)
+            {
+              memset(header + 80, 0, 48);
+              header[80] = 0x80;
+              header[126] = 0x02;
+              header[127] = 0x80;
+              {
+                std::lock_guard<std::mutex> lock(s_job_mutex);
+                s_job_request_list_sw.clear();
+                s_job_request_list_hw.clear();
+              }
+              templates++;
+              job_pool++;
+              s_working_current_job_id = job_pool & 0xFF;
+              s_wired_id = id;
+              pool_diff = diff;
+              nerd_mids(diget_mid, header);
+              turbo_sw_bake(diget_mid, header + 64, bake);
+              esp_sha_acquire_hardware();
+              sha_hal_hash_block(SHA2_256, header, 64 / 4, true);
+              sha_hal_read_digest(SHA2_256, hw_midstate);
+              esp_sha_release_hardware();
+              nonce_pool = 0;
+              mMonitor.NerdStatus = NM_Connecting;
+            }
+          } else if (cmd == 0x50)   // P
+          {
+            char *q = line + 2;
+            uint8_t div = (uint8_t)strtoul(q, &q, 10);
+            uint8_t mode = (uint8_t)strtoul(q, &q, 10);
+            uint8_t ref = (uint8_t)strtoul(q, &q, 10);
+            uint32_t us = 0;
+            bool ok = turbo_pll_set(div, &us, mode, ref);
+            wired_uart_begin();
+            uint32_t c, l, f;
+            turbo_pll_diag(&c, &l, &f);
+            Serial0.printf("p %u %d %u cal=%u lock=%u fb=%u ref=%u mhz=%u\n", (unsigned)turbo_pll_get(), ok ? 1 : 0, (unsigned)us, (unsigned)c, (unsigned)l, (unsigned)f, (unsigned)turbo_pll_ref(), (unsigned)turbo_pll_mhz());
+          } else if (cmd == 0x51)   // Q <div>: dry run
+          {
+            char *q = line + 2;
+            uint8_t div = (uint8_t)strtoul(q, &q, 10);
+            uint8_t mode = (uint8_t)strtoul(q, &q, 10);
+            uint8_t ref = (uint8_t)strtoul(q, &q, 10);
+            uint32_t us = 0, c, l, f;
+            bool ok = turbo_pll_dry(div, &us, mode, ref);
+            wired_uart_begin();
+            turbo_pll_diag(&c, &l, &f);
+            Serial0.printf("q %u %d %u cal=%u lock=%u fb=%u now=%u r8=%02x\n", (unsigned)div, ok ? 1 : 0, (unsigned)us, (unsigned)c, (unsigned)l, (unsigned)f, (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_r8());
+          } else if (cmd == 0x41)   // A
+          {
+            double d = atof(line + 2);
+            if (d > best_diff) best_diff = d;
+            shares++;
+            if (millis() > 10UL * 60 * 1000) turbo_crash_guard_stable();
+          } else if (cmd == 0x53)   // S
+            wired_status();
+          else if (cmd == 0x44)     // D
+          {
+            Serial0.printf("d\n");
+            Serial0.flush();
+            REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+            esp_restart();
+          } else if (cmd == 0x4F)   // O <size> <sha256>: update over the wire, start
+          {
+            char *q = line + 2;
+            s_ota_size = strtoul(q, &q, 10);
+            while (*q == 0x20) q++;
+            strncpy(s_ota_sha, q, 64); s_ota_sha[64] = 0;
+            if (s_ota) { esp_ota_abort(s_ota); s_ota = 0; }
+            s_ota_part = esp_ota_get_next_update_partition(NULL);
+            esp_err_t e = s_ota_part ? esp_ota_begin(s_ota_part, s_ota_size, &s_ota) : ESP_FAIL;
+            if (e != ESP_OK) s_ota = 0;
+            s_ota_off = 0;
+            Serial0.printf("o %d %s\n", e == ESP_OK ? 1 : 0, s_ota_part ? s_ota_part->label : "none");
+          } else if (cmd == 0x43)   // C <offset> <hex>
+          {
+            char *q = line + 2;
+            uint32_t off = strtoul(q, &q, 10);
+            while (*q == 0x20) q++;
+            size_t n = strlen(q) / 2;
+            static uint8_t buf[512];
+            bool ok = s_ota && off == s_ota_off && n > 0 && n <= sizeof(buf);
+            for (size_t i = 0; ok && i < n; ++i)
+            {
+              int hi = hexval(q[2 * i]), lo = hexval(q[2 * i + 1]);
+              if (hi < 0 || lo < 0) ok = false; else buf[i] = (uint8_t)(hi << 4 | lo);
+            }
+            if (ok && esp_ota_write(s_ota, buf, n) == ESP_OK) { s_ota_off += n; Serial0.printf("c %u\n", (unsigned)s_ota_off); }
+            else Serial0.printf("c! %u %u\n", (unsigned)off, (unsigned)s_ota_off);
+          } else if (cmd == 0x45)   // E: end, verify, boot it
+          {
+            esp_err_t e = (s_ota && s_ota_off == s_ota_size) ? esp_ota_end(s_ota) : ESP_FAIL;
+            s_ota = 0;
+            uint8_t h[32]; char hx[65];
+            if (e == ESP_OK)
+            {
+              esp_partition_get_sha256(s_ota_part, h);
+              for (int i = 0; i < 32; ++i) sprintf(hx + 2 * i, "%02x", h[i]);
+            }
+            else strcpy(hx, "end-failed");
+            // esp_partition_get_sha256 hashes the image as written (without the appended digest check), so compare
+            // against the file's SHA-256 only when sizes match; esp_ota_end already validated the image itself
+            bool ok = e == ESP_OK && esp_ota_set_boot_partition(s_ota_part) == ESP_OK;
+            Serial0.printf("e %d %s want %s\n", ok ? 1 : 0, hx, s_ota_sha);
+            Serial0.flush();
+            if (ok) { delay(200); esp_restart(); }
+          } else if (cmd == 0x4B)   // K <reg> <msb> <lsb> <val> | K (clear): BBPLL knobs for the next overclock
+          {
+            int n;
+            if (llen > 2)
+            {
+              char *q = line + 2;
+              uint8_t r = strtoul(q, &q, 10), hi = strtoul(q, &q, 10), lo = strtoul(q, &q, 10), v = strtoul(q, &q, 10);
+              n = turbo_knob(r, hi, lo, v);
+            }
+            else n = turbo_knob(0xff, 0, 0, 0);
+            Serial0.printf("k %d\n", n);
+          } else if (cmd == 0x58)   // X: BBPLL registers now and at boot
+          {
+            char b[200]; int o = 0;
+            o += snprintf(b + o, sizeof(b) - o, "x now");
+            for (int r = 0; r < 16; ++r) o += snprintf(b + o, sizeof(b) - o, " %02x", turbo_bb_reg(r));
+            o += snprintf(b + o, sizeof(b) - o, " boot");
+            for (int r = 0; r < 16; ++r) o += snprintf(b + o, sizeof(b) - o, " %02x", turbo_bb_boot(r));
+            Serial0.printf("%s\n", b);
+          } else if (cmd == 0x59)   // Y: stream the coredump partition (the last panic) as hex
+          {
+            const esp_partition_t *cd = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+            uint32_t len = 0;
+            if (cd) esp_partition_read(cd, 0, &len, 4);
+            if (!cd || len == 0 || len == 0xffffffff || len > cd->size) Serial0.printf("y end 0\n");
+            else
+            {
+              static uint8_t b[192];
+              char hx[2 * sizeof(b) + 1];
+              for (uint32_t off = 0; off < len; off += sizeof(b))
+              {
+                const uint32_t n = len - off < sizeof(b) ? len - off : sizeof(b);
+                esp_partition_read(cd, off, b, n);
+                for (uint32_t i = 0; i < n; ++i) sprintf(hx + 2 * i, "%02x", b[i]);
+                Serial0.printf("y %u %s\n", (unsigned)off, hx);
+                Serial0.flush();
+              }
+              Serial0.printf("y end %u\n", (unsigned)len);
+            }
+          } else if (cmd == 0x42)   // B: PIE SIMD benchmark
+          {
+            Serial0.printf("%s\n", pie_bench().c_str());
+          } else if (cmd == 0x55)   // U: SHA bus / split-burst benchmark
+          {
+            static char ub[900];
+            turbo_bus_bench(ub, sizeof(ub));
+            Serial0.printf("b %s\n", ub);
+          } else if (cmd == 0x47)   // G: Turbo9 loop experiments
+          {
+            static char xb[1200];
+            turbo_exp_bench_core0(xb, sizeof(xb));
+            Serial0.printf("b %s\n", xb);
+          } else if (cmd == 0x56)   // V [code]: core voltage
+          {
+            if (llen > 2) turbo_vdig_set((uint8_t)atoi(line + 2));
+            Serial0.printf("v boot=%u now=%u r4=%02x r5=%02x r6=%02x r7=%02x\n", (unsigned)turbo_vdig_boot(), (unsigned)turbo_vdig_get(),
+                           turbo_vdig_reg(4), turbo_vdig_reg(5), turbo_vdig_reg(6), turbo_vdig_reg(7));
+          } else if (cmd == 0x5A)   // Z: clear the crash guard, reboot (back to the fast engine)
+          {
+            turbo_crash_guard_stable();
+            Serial0.printf("z\n");
+            Serial0.flush();
+            delay(50);
+            esp_restart();
+          } else if (cmd == 0x52)   // R
+          {
+            Serial0.flush();
+            esp_restart();
+          }
+        }
+        llen = 0;
+      } else if (llen < sizeof(line) - 1)
+        line[llen++] = (char)c;
+      else
+        llen = 0;
+    }
+
+    std::list<std::shared_ptr<JobResult>> job_result_list;
+    if (job_pool != 0xFFFFFFFF)
+    {
+      std::lock_guard<std::mutex> lock(s_job_mutex);
+      job_result_list.insert(job_result_list.end(), s_job_result_list.begin(), s_job_result_list.end());
+      s_job_result_list.clear();
+      while (s_job_request_list_sw.size() < 4)
+      {
+        JobPush(s_job_request_list_sw, job_pool, nonce_pool, NONCE_PER_JOB_SW, pool_diff, header, diget_mid, bake);
+        nonce_pool += NONCE_PER_JOB_SW;
+      }
+      while (s_job_request_list_hw.size() < HW_QUEUE_DEPTH)
+      {
+        JobPush(s_job_request_list_hw, job_pool, nonce_pool, NONCE_PER_JOB_HW, pool_diff, header, hw_midstate, bake);
+        nonce_pool += NONCE_PER_JOB_HW;
+      }
+    }
+    while (!job_result_list.empty())
+    {
+      std::shared_ptr<JobResult> res = job_result_list.front();
+      job_result_list.pop_front();
+      hashes += res->nonce_count;
+      if (res->difficulty > pool_diff && job_pool == res->id && res->nonce != 0xFFFFFFFF)
+        Serial0.printf("N %u %08x %.6g\n", (unsigned)s_wired_id, (unsigned)res->nonce, res->difficulty);
+    }
+    if (millis() - last_status >= 2000)
+    {
+      last_status = millis();
+      wired_status();
+    }
+    g_strat_loops++;
+    nm_rtcwdt_feed();
+    vTaskDelay((s_ota ? 1 : 20) / portTICK_PERIOD_MS);
+  }
+}
+#endif

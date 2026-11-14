@@ -10,13 +10,85 @@
 #include "monitor.h"
 #include "OpenFontRender.h"
 #include "rotation.h"
+#include "utils.h"
+#include <WiFi.h>
 
 #define WIDTH 340
 #define HEIGHT 170
 
-OpenFontRender render;
 TFT_eSPI tft = TFT_eSPI();                  // Invoke library, pins defined in User_Setup.h
+#ifndef NM_TURBO
+OpenFontRender render;
 TFT_eSprite background = TFT_eSprite(&tft); // Invoke library sprite
+#endif
+
+#ifdef NM_TURBO
+//Turbo: plain TFT_eSPI text redrawn every few seconds instead of the image + FreeType
+//screens, which took a frame copy from flash and font rendering every second
+extern volatile uint32_t shares;
+extern double best_diff;
+extern uint32_t Mhashes;
+extern uint32_t hashes;
+const char *turbo_hw_mode_name();
+bool turboPoolUp();
+
+#define TURBO_REDRAW_S 5
+
+void tDisplay_Init(void)
+{
+#ifdef PIN_ENABLE5V
+  pinMode(PIN_ENABLE5V, OUTPUT);
+  digitalWrite(PIN_ENABLE5V, HIGH);
+#endif
+  tft.init();
+  tft.setRotation(ROTATION_90);
+  tft.setSwapBytes(true);
+}
+
+void tDisplay_MinerScreen(unsigned long mElapsed)
+{
+  static uint32_t calls = 0;
+  static uint32_t last_ms = 0;
+  static uint64_t last_hashes = 0;
+  if (calls++ % TURBO_REDRAW_S != 0)
+    return;
+
+  uint32_t now = millis();
+  uint64_t total = (uint64_t)Mhashes * 1000000ULL + hashes;
+  float khs = 0;
+  if (last_ms && now > last_ms && total >= last_hashes)
+    khs = (float)(total - last_hashes) / (float)(now - last_ms);
+  last_ms = now;
+  last_hashes = total;
+
+  if (calls == 1)
+    tft.fillScreen(TFT_BLACK);
+
+  char line[48];
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  tft.setTextPadding(0);
+  tft.drawString("NerdMiner turbo", 8, 6, 2);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(line, sizeof(line), "%.1f", khs);
+  tft.setTextPadding(200);
+  tft.drawString(line, 8, 30, 7);
+  tft.setTextPadding(0);
+  tft.drawString("kH/s", 214, 56, 4);
+
+  char best[16] = {0};
+  suffix_string(best_diff, best, sizeof(best), 0);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.setTextPadding(320);
+  snprintf(line, sizeof(line), "shares %u   best %s", (unsigned)shares, best);
+  tft.drawString(line, 8, 94, 2);
+  snprintf(line, sizeof(line), "pool %s   %d dBm   %.0f C", turboPoolUp() ? "ok" : "DOWN", (int)WiFi.RSSI(), temperatureRead());
+  tft.drawString(line, 8, 116, 2);
+  snprintf(line, sizeof(line), "HW %s   %s", turbo_hw_mode_name(), WiFi.localIP().toString().c_str());
+  tft.drawString(line, 8, 138, 2);
+}
+
+#else
 
 void tDisplay_Init(void)
 {
@@ -47,6 +119,8 @@ void tDisplay_Init(void)
   }
 }
 
+#endif //NM_TURBO
+
 void tDisplay_AlternateScreenState(void)
 {
   int screen_state = digitalRead(TFT_BL);
@@ -59,6 +133,7 @@ void tDisplay_AlternateRotation(void)
   tft.setRotation( flipRotation(tft.getRotation()) );
 }
 
+#ifndef NM_TURBO
 void tDisplay_MinerScreen(unsigned long mElapsed)
 {
   mining_data data = getMiningData(mElapsed);
@@ -249,6 +324,8 @@ void tDisplay_BTCprice(unsigned long mElapsed)
   background.pushSprite(0, 0);
 }
 
+#endif //NM_TURBO
+
 void tDisplay_LoadingScreen(void)
 {
   tft.fillScreen(TFT_BLACK);
@@ -270,7 +347,11 @@ void tDisplay_DoLedStuff(unsigned long frame)
 {
 }
 
+#ifdef NM_TURBO
+CyclicScreenFunction tDisplayCyclicScreens[] = {tDisplay_MinerScreen};
+#else
 CyclicScreenFunction tDisplayCyclicScreens[] = {tDisplay_MinerScreen, tDisplay_ClockScreen, tDisplay_GlobalHashScreen, tDisplay_BTCprice};
+#endif
 
 DisplayDriver tDisplayDriver = {
     tDisplay_Init,

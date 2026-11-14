@@ -19,6 +19,10 @@
 void runMonitor(void *name);
 
 void runStratumWorker(void *name);
+#ifdef NM_WIRED
+void runWiredWorker(void *name);
+void wired_boot_window();
+#endif
 void runMiner(void *name);
 
 void minerWorkerSw(void * task_id);

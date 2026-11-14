@@ -21,6 +21,13 @@
 #endif
 
 #include <soc/soc_caps.h>
+
+#ifdef NM_TURBO
+#include <ArduinoOTA.h>
+//Status port: answers every connection with one line of JSON and closes it
+WiFiServer statusServer(80);
+String turboStatusJson();
+#endif
 //#define HW_SHA256_TEST
 
 //3 seconds WDT
@@ -72,6 +79,15 @@ void setup()
 #endif //MONITOR_SPEED
 
   Serial.setTimeout(0);
+#ifdef NM_WIRED
+  wired_boot_window();
+#endif
+#ifdef NM_TURBO
+  //Never block on USB serial: once a USB host polls the port (e.g. a tablet or PC that
+  //doesn't read it) the core raises the TX timeout to 100 ms and every print stalls the
+  //calling task, which starved the miners of jobs
+  Serial.setTxTimeoutMs(0);
+#endif
   delay(SECOND_MS/10);
 
   esp_task_wdt_init(WDT_MINER_TIMEOUT, true);
@@ -122,8 +138,10 @@ void setup()
   SDCrd.initSDcard();
 #endif
 
+#ifndef NM_WIRED
   /******** INIT WIFI ************/
   init_WifiManager();
+#endif
 
   /******** CREATE TASK TO PRINT SCREEN *****/
   //tft.pushImage(0, 0, MinerWidth, MinerHeight, MinerScreen);
@@ -146,6 +164,8 @@ void setup()
  #elif defined(ESP32_2432S028R) || defined(ESP32_2432S028_2USB)
   // Free a little bit of the heap to the screen
   BaseType_t res2 = xTaskCreatePinnedToCore(runStratumWorker, "Stratum", 13500, (void*)stratum_name, 4, NULL,1);
+ #elif defined(NM_WIRED)
+  BaseType_t res2 = xTaskCreatePinnedToCore(runWiredWorker, "Wired", 8000, (void*)stratum_name, 4, NULL,1);
  #else
   BaseType_t res2 = xTaskCreatePinnedToCore(runStratumWorker, "Stratum", 15000, (void*)stratum_name, 4, NULL,1);
  #endif
@@ -162,6 +182,8 @@ void setup()
     #if defined(CONFIG_IDF_TARGET_ESP32)
     xTaskCreate(minerWorkerHw, "MinerHw-0", 3584, (void*)0, 3, &minerTask1); // Reduced for ESP32 classic
     //xTaskCreate(minerWorkerSw, "MinerSw-0", 5000, (void*)0, 1, &minerTask1); // Reduced for ESP32 classic
+    #elif defined(NM_TURBO)
+    xTaskCreate(minerWorkerHw, "MinerHw-0", 6144, (void*)0, 3, &minerTask1);
     #else
     xTaskCreate(minerWorkerHw, "MinerHw-0", 4096, (void*)0, 3, &minerTask1);
     #endif
@@ -187,6 +209,15 @@ void setup()
 
   /******** MONITOR SETUP *****/
   setup_monitor();
+
+#if defined(NM_TURBO) && !defined(NM_WIRED)
+  /******** OTA + STATUS PORT *****/
+  ArduinoOTA.setHostname("nerdminer-turbo");
+  ArduinoOTA.setPassword(NM_OTA_PASS);
+  ArduinoOTA.begin();
+  statusServer.begin();
+  Serial.printf("OTA and status port up at %s\n", WiFi.localIP().toString().c_str());
+#endif
 }
 
 void app_error_fault_handler(void *arg) {
@@ -213,7 +244,26 @@ void loop() {
 #ifdef TOUCH_ENABLE
   touchHandler.isTouched();
 #endif
+#ifndef NM_WIRED
   wifiManagerProcess(); // avoid delays() in loop when non-blocking and other long running code
+#endif
+
+#if defined(NM_TURBO) && !defined(NM_WIRED)
+  ArduinoOTA.handle();
+  WiFiClient c = statusServer.available();
+  if (c)
+  {
+    //Drain the request first: closing with unread data resets the connection
+    uint32_t t0 = millis();
+    while (c.connected() && !c.available() && millis() - t0 < 100)
+      vTaskDelay(2 / portTICK_PERIOD_MS);
+    while (c.available())
+      c.read();
+    c.print("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+    c.print(turboStatusJson());
+    c.stop();
+  }
+#endif
 
   vTaskDelay(50 / portTICK_PERIOD_MS);
 }
