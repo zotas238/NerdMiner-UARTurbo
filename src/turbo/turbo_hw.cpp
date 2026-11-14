@@ -24,6 +24,7 @@
 #include <hal/sha_ll.h>
 #include "mbedtls/sha256.h"
 #include "turbo_hw.h"
+#include "turbo_pll.h"
 #ifdef NM_WIRED
 extern bool g_wired;
 #endif
@@ -83,6 +84,7 @@ struct Ctx
 
 static void candidate(Ctx &c, uint32_t nonce, const uint8_t *hash)
 {
+  TurboZone _z;
   s_cands++;
   if (!turbo_ref_check(c.hdr, nonce, hash))
   {
@@ -1081,6 +1083,7 @@ static bool s_t1_ok = false;
 
 #include "bus_bench.inc"
 #include "exp_bench.inc"
+#include "stress.inc"
 
 void turbo_hw_init()
 {

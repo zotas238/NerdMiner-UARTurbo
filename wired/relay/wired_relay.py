@@ -52,7 +52,8 @@ LOG = STATE_DIR / "relay.log"; OC = STATE_DIR / "oc.json"
 host, _, port = args.pool.rpartition(":")
 POOL = (host, int(port))
 USER = args.user
-# Overclock kept across boots, e.g. {"div": 11, "mode": 48} = 300 MHz (div 8 = stock 240 MHz). See README.
+# Overclock kept across boots, e.g. {"div": 12, "mode": 112, "vdig": 30} = 320 MHz, {"div": 11, "mode": 48} = 300 MHz
+# (div 8 = stock 240 MHz). See README.
 # Sent OC_DELAY s after each boot and after the relay takes the port back. Never stepped down: a crash just reboots into it.
 OC_DELAY = 30
 JOB_REFRESH = 30          # s: new extranonce2 / ntime even without a notify
@@ -238,7 +239,8 @@ def main():
             # overclock after boot
             if oc_at and time.time() > oc_at and ser:
                 c = oc_load(); oc_at = 0
-                ser.write(("P %d %d\n" % (c["div"], c.get("mode", 0))).encode()); log("overclock: P", c["div"], c.get("mode", 0)); oc_applied = time.time()
+                pc = "P %d %d %d %d" % (c["div"], c.get("mode", 0), c.get("ref", 0), c.get("vdig", 0))
+                ser.write((pc + "\n").encode()); log("overclock:", pc); oc_applied = time.time()
             # block height for the screen, only when it changes (and after a boot / port reopen)
             if ser and height and height != sent_height:
                 ser.write(("L %d %d\n" % (height, height)).encode()); sent_height = height

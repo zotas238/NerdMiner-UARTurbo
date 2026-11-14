@@ -275,9 +275,27 @@ static bool turbo_pll_do(uint8_t div, bool dry, uint32_t *us_out, uint8_t mode, 
   return st == 3;
 }
 
-bool turbo_pll_set(uint8_t div, uint32_t *us_out, uint8_t mode, uint8_t ref)
+static void zone_park_slow();
+//mode bit 64 (zoned, for 320 MHz): core voltage first (vdig, clamped to boot..30), CPU onto PLL/3 so the
+//switch lands there, VCO band forced above 600 MHz (it won't calibrate there), then slow zones on: the
+//miners run at PLL/2, everything that formats/parses/does double math at PLL/3. Found 2026-11-14: at
+//320 the CPU passes every kernel alone; it fails only with both cores on SRAM at once, and V29 fixes that.
+bool turbo_pll_set(uint8_t div, uint32_t *us_out, uint8_t mode, uint8_t ref, uint8_t vdig)
 {
+  if (mode & 64)
+  {
+    if (vdig > s_boot_vdig && vdig <= 30) turbo_vdig_set(vdig);
+    zone_park_slow();
+    s_nknob = 0;
+    if (div >= 12)
+    {
+      turbo_knob(1, 4, 4, 1);
+      turbo_knob(1, 3, 0, 0);
+    }
+    if (div >= 13) turbo_knob(6, 2, 0, 0);   // DCUR 0: the only setting that locks 680
+  }
   const bool ok = turbo_pll_do(div, false, us_out, mode, ref);
+  if ((mode & 64) && s_div != 8) turbo_zone_set(true);
   if (s_div == 8) turbo_vdig_set(s_boot_vdig);   // stock clock: stock voltage
   return ok;
 }
@@ -307,3 +325,76 @@ uint8_t turbo_vdig_set(uint8_t v)
   rom_i2c_writeReg_Mask(I2C_DIG_REG, I2C_DIG_REG_HOSTID, 6, 4, 0, v);
   return turbo_vdig_get();
 }
+
+//I: read-modify-write one SYSTEM clock register (DR_REG_SYSTEM_BASE block only) with interrupts
+//off and the other core stalled, for clock-tree experiments (CPUPERIOD_SEL, PLL_FREQ_SEL, ...)
+static void IRAM_ATTR poke_inner(uint32_t addr, uint32_t mask, uint32_t val, uint32_t *before)
+{
+  const uint32_t b = REG_READ(addr);
+  *before = b;
+  REG_WRITE(addr, (b & ~mask) | (val & mask));
+  spin(20000);
+}
+uint32_t turbo_sysreg_poke(uint32_t addr, uint32_t mask, uint32_t val, uint32_t *before)
+{
+  *before = 0xFFFFFFFF;
+  if (addr < DR_REG_SYSTEM_BASE || addr >= DR_REG_SYSTEM_BASE + 0x1000 || (addr & 3)) return 0xFFFFFFFF;
+  if (mask == 0) { *before = REG_READ(addr); return *before; }
+  const int other = xPortGetCoreID() ^ 1;
+  portENTER_CRITICAL(&s_mux);
+  esp_cpu_stall(other);
+  poke_inner(addr, mask, val, before);
+  esp_cpu_unstall(other);
+  portEXIT_CRITICAL(&s_mux);
+  return REG_READ(addr);
+}
+
+//Slow zones: at 320 MHz the CPU fails in double-precision soft-float (ROM libgcc via _dtoa_r,
+//the same spot as the ~daily 300 MHz crash) long before the SHA loops do. With zones on, any
+//code that formats, parses or does double math runs with the CPU at PLL/3 and the miners run at
+//PLL/2 the rest of the time. One depth counter for both cores (they share the CPU clock).
+static portMUX_TYPE s_zmux = portMUX_INITIALIZER_UNLOCKED;
+static DRAM_ATTR volatile uint8_t s_zone_on = 0;
+static DRAM_ATTR volatile int32_t s_zone_depth = 0;
+static DRAM_ATTR volatile uint32_t s_zone_n = 0;
+#define ZONE_FAST 2   // CPUPERIOD_SEL: PLL/2
+#define ZONE_SLOW 1   // PLL/3
+static inline void IRAM_ATTR zone_write(uint32_t sel)
+{
+  const int other = xPortGetCoreID() ^ 1;
+  esp_cpu_stall(other);
+  const uint32_t per = REG_READ(SYSTEM_CPU_PER_CONF_REG);
+  REG_WRITE(SYSTEM_CPU_PER_CONF_REG, (per & ~SYSTEM_CPUPERIOD_SEL) | sel);
+  spin(40);
+  esp_cpu_unstall(other);
+  s_zone_n++;
+}
+void IRAM_ATTR turbo_zone_enter()
+{
+  portENTER_CRITICAL_SAFE(&s_zmux);
+  if (s_zone_depth++ == 0 && s_zone_on) zone_write(ZONE_SLOW);
+  portEXIT_CRITICAL_SAFE(&s_zmux);
+}
+void IRAM_ATTR turbo_zone_exit()
+{
+  portENTER_CRITICAL_SAFE(&s_zmux);
+  if (--s_zone_depth == 0 && s_zone_on) zone_write(ZONE_FAST);
+  if (s_zone_depth < 0) s_zone_depth = 0;
+  portEXIT_CRITICAL_SAFE(&s_zmux);
+}
+//on: zones switch the clock from now on (the caller is inside a zone, so it goes slow now and fast at
+//the exit). off: CPU back to PLL/2 for good.
+void turbo_zone_set(bool on)
+{
+  portENTER_CRITICAL(&s_zmux);
+  s_zone_on = on;
+  zone_write(on && s_zone_depth > 0 ? ZONE_SLOW : ZONE_FAST);
+  portEXIT_CRITICAL(&s_zmux);
+}
+static void zone_park_slow()
+{
+  portENTER_CRITICAL(&s_zmux);
+  zone_write(ZONE_SLOW);
+  portEXIT_CRITICAL(&s_zmux);
+}
+void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth) { *on = s_zone_on; *n = s_zone_n; *depth = s_zone_depth; }

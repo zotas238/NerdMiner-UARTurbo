@@ -18,5 +18,7 @@ void turbo_crash_guard_stable();
 extern volatile uint32_t g_hw_hashes;
 //Relay U: bus/split-burst benchmark, one line into buf (holds the SHA engine < 1 s)
 int turbo_bus_bench(char *buf, size_t len);
+int turbo_stress(uint32_t k, uint32_t reps, uint32_t flags, char *buf, size_t len);
+uint32_t turbo_stress_last();
 int turbo_exp_bench(char *buf, size_t len);
 int turbo_exp_bench_core0(char *buf, size_t len);

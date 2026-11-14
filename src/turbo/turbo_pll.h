@@ -6,7 +6,7 @@
 //reported lock; *us_out = time spent on the crystal while it relocked
 //mode: bit 0 power-cycle + recalibrate the PLL (else rewrite the divider live), bit 1 use the flash guard
 //(else stall the other core), bit 2 keep MSPI in high-speed mode
-bool turbo_pll_set(uint8_t div, uint32_t *us_out, uint8_t mode = 0, uint8_t ref = 0);
+bool turbo_pll_set(uint8_t div, uint32_t *us_out, uint8_t mode = 0, uint8_t ref = 0, uint8_t vdig = 0);
 uint8_t turbo_pll_get();
 //Divider this boot started from, and the last one tried before a reset (RTC memory)
 uint8_t turbo_pll_last_try();
@@ -29,4 +29,11 @@ uint8_t turbo_vdig_set(uint8_t v);
 uint8_t turbo_bb_reg(uint8_t r);
 uint8_t turbo_bb_boot(uint8_t r);
 int turbo_knob(uint8_t reg, uint8_t msb, uint8_t lsb, uint8_t val);
+uint32_t turbo_sysreg_poke(uint32_t addr, uint32_t mask, uint32_t val, uint32_t *before);
 uint8_t turbo_pll_last_r8();
+
+void turbo_zone_enter();
+void turbo_zone_exit();
+void turbo_zone_set(bool on);
+void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth);
+struct TurboZone { TurboZone() { turbo_zone_enter(); } ~TurboZone() { turbo_zone_exit(); } TurboZone(const TurboZone &) = delete; };

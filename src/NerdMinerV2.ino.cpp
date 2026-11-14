@@ -64,6 +64,25 @@ const char* ntpServer = "pool.ntp.org";
 
 
 /********* INIT *****/
+#ifdef NM_TURBO
+#include <esp_heap_caps.h>
+//PSRAM fence (2026-11-14): PSRAM and flash are clocked from the PLL through the MSPI bus, not from the
+//CPU divider, so at 680 MHz PLL the PSRAM link fails (a GDMA spinlock in PSRAM read back as garbage).
+//The miner needs no PSRAM: all heap allocations go internal, and the free PSRAM is held here.
+uint32_t g_psram_fence[3];   // total, free before the fence, held
+static void psram_fence()
+{
+  heap_caps_malloc_extmem_enable(SIZE_MAX);
+  g_psram_fence[0] = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  g_psram_fence[1] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  for (int i = 0; i < 64; ++i)
+  {
+    const size_t b = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (b < 16 || !heap_caps_malloc(b, MALLOC_CAP_SPIRAM)) break;
+    g_psram_fence[2] += b;
+  }
+}
+#endif
 void setup()
 {
       //Init pin 15 to eneble 5V external power (LilyGo bug)
@@ -82,6 +101,9 @@ void setup()
 #ifdef NM_WIRED
   //Wired or Wi-Fi: decided once here, from whether a host's UART TX holds GPIO44 high
   g_wired = wired_detect();
+#ifdef NM_TURBO
+  if (g_wired) psram_fence();   // Wi-Fi mode keeps PSRAM (stock clock there)
+#endif
   //Always open the wire's boot window, so a "D" can still rescue a board that guessed wrong
   wired_boot_window();
 #endif

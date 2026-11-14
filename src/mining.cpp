@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
+#include "turbo/turbo_pll.h"
 #include <nvs_flash.h>
 #include <nvs.h>
 //#include "ShaTests/nerdSHA256.h"
@@ -1061,6 +1062,7 @@ void minerWorkerHw(void * task_id)
           }
 #endif
           //~5 per second
+          TurboZone _z;
           double diff_hash = diff_from_target(hash);
           if (diff_hash > result->difficulty)
           {
@@ -1291,6 +1293,7 @@ void minerWorkerHw(void * task_id)
         if (nerd_sha_ll_read_digest_swap_if(hash))
         {
           //~5 per second
+          TurboZone _z;
           double diff_hash = diff_from_target(hash);
           if (diff_hash > result->difficulty)
           {
@@ -1426,6 +1429,7 @@ void runMonitor(void *name)
     uint32_t mElapsed = now_millis - mLastCheck;
     if (mElapsed >= 1000)
     { 
+      TurboZone _z;
       mLastCheck = now_millis;
       last_update_millis = now_millis;
       unsigned long currentKHashes = (Mhashes * 1000) + hashes / 1000;
@@ -1596,15 +1600,19 @@ static int hexval(char c)
   return -1;
 }
 
+extern uint32_t g_psram_fence[3];
 static void wired_status()
 {
+  uint32_t zon, zn; int32_t zd;
+  turbo_zone_info(&zon, &zn, &zd);
   String js = turboStatusJson();
   js.trim();
   if (js.endsWith("}"))
     js.remove(js.length() - 1);
-  Serial0.printf("T %s,\"pll\":%u,\"ref\":%u,\"mhz\":%u,\"vdig\":%u,\"pll_last_try\":%u,\"wired_id\":%u}\n", js.c_str(),
+  Serial0.printf("T %s,\"pll\":%u,\"ref\":%u,\"mhz\":%u,\"vdig\":%u,\"pll_last_try\":%u,\"wired_id\":%u,\"zone\":[%u,%u,%d],\"psram\":[%u,%u,%u,%u]}\n", js.c_str(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_ref(), (unsigned)turbo_pll_mhz(), (unsigned)turbo_vdig_get(),
-                 (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id);
+                 (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id, (unsigned)zon, (unsigned)zn, (int)zd,
+                 (unsigned)g_psram_fence[0], (unsigned)g_psram_fence[1], (unsigned)g_psram_fence[2], (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 bool g_wired = false;
@@ -1718,8 +1726,8 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v11 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
-                 (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
+  Serial0.printf("\nH nerdminer-wired v17 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
+                 (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage(), (unsigned)turbo_stress_last());
 
   double pool_diff = DEFAULT_DIFFICULTY;
   uint32_t nonce_pool = 0;
@@ -1735,6 +1743,8 @@ void runWiredWorker(void *name)
 
   while (true)
   {
+   {
+    TurboZone _z;
     while (Serial0.available())
     {
       int c = Serial0.read();
@@ -1789,8 +1799,9 @@ void runWiredWorker(void *name)
             uint8_t div = (uint8_t)strtoul(q, &q, 10);
             uint8_t mode = (uint8_t)strtoul(q, &q, 10);
             uint8_t ref = (uint8_t)strtoul(q, &q, 10);
+            uint8_t vd = (uint8_t)strtoul(q, &q, 10);
             uint32_t us = 0;
-            bool ok = turbo_pll_set(div, &us, mode, ref);
+            bool ok = turbo_pll_set(div, &us, mode, ref, vd);
             wired_uart_begin();
             uint32_t c, l, f;
             turbo_pll_diag(&c, &l, &f);
@@ -1953,6 +1964,27 @@ void runWiredWorker(void *name)
             static char xb[1200];
             turbo_exp_bench_core0(xb, sizeof(xb));
             Serial0.printf("b %s\n", xb);
+          } else if (cmd == 0x49)   // I <addr> <mask> <val> (hex): SYSTEM clock register poke, then true CPU MHz
+          {
+            char *q = line + 2;
+            uint32_t a = strtoul(q, &q, 16), m = strtoul(q, &q, 16), v = strtoul(q, &q, 16), b;
+            if (a == 0) turbo_zone_set(m != 0);   // I 0 <on>: slow zones
+            uint32_t now = a == 0 ? 0 : turbo_sysreg_poke(a, m, v, &b);
+            if (a == 0) b = 0;
+            const int64_t t0 = esp_timer_get_time();
+            uint32_t c0;
+            asm volatile("rsr %0, ccount" : "=a"(c0));
+            while (esp_timer_get_time() - t0 < 4000) {}
+            uint32_t c1;
+            asm volatile("rsr %0, ccount" : "=a"(c1));
+            Serial0.printf("x poke %08x before=%08x now=%08x mhz=%u\n", (unsigned)a, (unsigned)b, (unsigned)now, (unsigned)((c1 - c0 + 2000) / 4000));
+          } else if (cmd == 0x4E)   // N <kernel> <reps>: stress a kernel at PLL/2 (see turbo/stress.inc)
+          {
+            char *q = line + 2;
+            uint32_t k = strtoul(q, &q, 10), r = strtoul(q, &q, 10), f = strtoul(q, &q, 10);
+            static char sb[160];
+            turbo_stress(k, r, f, sb, sizeof(sb));
+            Serial0.printf("%s\n", sb);
           } else if (cmd == 0x56)   // V [code]: core voltage
           {
             if (llen > 2) turbo_vdig_set((uint8_t)atoi(line + 2));
@@ -2008,6 +2040,7 @@ void runWiredWorker(void *name)
       last_status = millis();
       wired_status();
     }
+   }
     g_strat_loops++;
     nm_rtcwdt_feed();
     vTaskDelay((s_ota ? 1 : 20) / portTICK_PERIOD_MS);
