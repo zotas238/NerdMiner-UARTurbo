@@ -24,6 +24,9 @@
 #include <hal/sha_ll.h>
 #include "mbedtls/sha256.h"
 #include "turbo_hw.h"
+#ifdef NM_WIRED
+extern bool g_wired;
+#endif
 #include "sha256_sw.h"
 #include "../utils.h"
 
@@ -1098,8 +1101,8 @@ void turbo_hw_init()
     if (c5 && c5 < now)
       s_mode = MODE_T5;
 #ifdef NM_WIRED
-    //tested with Wi-Fi off only (the Wi-Fi build keeps the chip default)
-    if (s_mode == MODE_T5)
+    //tested with Wi-Fi off only (Wi-Fi mode keeps the chip default)
+    if (g_wired && s_mode == MODE_T5)
     {
       turbo_split_pick();
       turbo_nb_pick();

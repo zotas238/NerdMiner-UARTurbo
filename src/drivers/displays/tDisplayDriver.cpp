@@ -25,12 +25,9 @@ TFT_eSprite background = TFT_eSprite(&tft); // Invoke library sprite
 #ifdef NM_TURBO
 //Turbo: plain TFT_eSPI text redrawn every few seconds instead of the image + FreeType
 //screens, which took a frame copy from flash and font rendering every second
-extern volatile uint32_t shares;
-extern double best_diff;
 extern uint32_t Mhashes;
 extern uint32_t hashes;
-const char *turbo_hw_mode_name();
-bool turboPoolUp();
+#include "mining.h"
 
 #define TURBO_REDRAW_S 5
 
@@ -67,7 +64,16 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   char line[48];
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
   tft.setTextPadding(0);
-  tft.drawString("NerdMiner turbo", 8, 6, 2);
+  tft.drawString("NerdMiner UARTurbo", 8, 6, 2);
+  //signal strength only means something in Wi-Fi mode
+  tft.setTextPadding(110);
+  if (g_wired)
+    line[0] = 0;
+  else
+    snprintf(line, sizeof(line), "%d dBm", (int)WiFi.RSSI());
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(line, 312, 6, 2);
+  tft.setTextDatum(TL_DATUM);
 
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   snprintf(line, sizeof(line), "%.1f", khs);
@@ -76,16 +82,17 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   tft.setTextPadding(0);
   tft.drawString("kH/s", 214, 56, 4);
 
-  char best[16] = {0};
-  suffix_string(best_diff, best, sizeof(best), 0);
+  char ever[16] = {0}, session[16] = {0};
+  suffix_string(best_ever, ever, sizeof(ever), 0);
+  suffix_string(best_session, session, sizeof(session), 0);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.setTextPadding(320);
-  snprintf(line, sizeof(line), "shares %u   best %s", (unsigned)shares, best);
-  tft.drawString(line, 8, 94, 2);
-  snprintf(line, sizeof(line), "pool %s   %d dBm   %.0f C", turboPoolUp() ? "ok" : "DOWN", (int)WiFi.RSSI(), temperatureRead());
-  tft.drawString(line, 8, 116, 2);
-  snprintf(line, sizeof(line), "HW %s   %s", turbo_hw_mode_name(), WiFi.localIP().toString().c_str());
-  tft.drawString(line, 8, 138, 2);
+  tft.setTextPadding(312);
+  snprintf(line, sizeof(line), "Best ever  %s", ever);
+  tft.drawString(line, 8, 88, 4);
+  snprintf(line, sizeof(line), "Best session  %s", session);
+  tft.drawString(line, 8, 114, 4);
+  snprintf(line, sizeof(line), "Temp  %.0f C", temperatureRead());
+  tft.drawString(line, 8, 140, 4);
 }
 
 #else

@@ -20,8 +20,20 @@ void runMonitor(void *name);
 
 void runStratumWorker(void *name);
 #ifdef NM_WIRED
+//true: work comes over the UART from the relay, Wi-Fi stays off (chosen at boot)
+extern bool g_wired;
+bool wired_detect();
 void runWiredWorker(void *name);
 void wired_boot_window();
+void wired_watch();
+#else
+static const bool g_wired = false;
+#endif
+#ifdef NM_TURBO
+//best share difficulty: ever (kept in NVS) and since this boot
+extern double best_ever, best_session;
+void turbo_best_begin();
+void turbo_best_note(double d);
 #endif
 void runMiner(void *name);
 

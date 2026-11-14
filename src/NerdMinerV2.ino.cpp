@@ -80,7 +80,13 @@ void setup()
 
   Serial.setTimeout(0);
 #ifdef NM_WIRED
+  //Wired or Wi-Fi: decided once here, from whether a host's UART TX holds GPIO44 high
+  g_wired = wired_detect();
+  //Always open the wire's boot window, so a "D" can still rescue a board that guessed wrong
   wired_boot_window();
+#endif
+#ifdef NM_TURBO
+  turbo_best_begin();
 #endif
 #ifdef NM_TURBO
   //Never block on USB serial: once a USB host polls the port (e.g. a tablet or PC that
@@ -138,10 +144,9 @@ void setup()
   SDCrd.initSDcard();
 #endif
 
-#ifndef NM_WIRED
   /******** INIT WIFI ************/
-  init_WifiManager();
-#endif
+  if (!g_wired)
+    init_WifiManager();
 
   /******** CREATE TASK TO PRINT SCREEN *****/
   //tft.pushImage(0, 0, MinerWidth, MinerHeight, MinerScreen);
@@ -165,7 +170,8 @@ void setup()
   // Free a little bit of the heap to the screen
   BaseType_t res2 = xTaskCreatePinnedToCore(runStratumWorker, "Stratum", 13500, (void*)stratum_name, 4, NULL,1);
  #elif defined(NM_WIRED)
-  BaseType_t res2 = xTaskCreatePinnedToCore(runWiredWorker, "Wired", 8000, (void*)stratum_name, 4, NULL,1);
+  BaseType_t res2 = g_wired ? xTaskCreatePinnedToCore(runWiredWorker, "Wired", 8000, (void*)stratum_name, 4, NULL,1)
+                            : xTaskCreatePinnedToCore(runStratumWorker, "Stratum", 15000, (void*)stratum_name, 4, NULL,1);
  #else
   BaseType_t res2 = xTaskCreatePinnedToCore(runStratumWorker, "Stratum", 15000, (void*)stratum_name, 4, NULL,1);
  #endif
@@ -210,13 +216,16 @@ void setup()
   /******** MONITOR SETUP *****/
   setup_monitor();
 
-#if defined(NM_TURBO) && !defined(NM_WIRED)
-  /******** OTA + STATUS PORT *****/
-  ArduinoOTA.setHostname("nerdminer-turbo");
-  ArduinoOTA.setPassword(NM_OTA_PASS);
-  ArduinoOTA.begin();
-  statusServer.begin();
-  Serial.printf("OTA and status port up at %s\n", WiFi.localIP().toString().c_str());
+#ifdef NM_TURBO
+  /******** OTA + STATUS PORT (Wi-Fi mode) *****/
+  if (!g_wired)
+  {
+    ArduinoOTA.setHostname("nerdminer-turbo");
+    ArduinoOTA.setPassword(NM_OTA_PASS);
+    ArduinoOTA.begin();
+    statusServer.begin();
+    Serial.printf("OTA and status port up at %s\n", WiFi.localIP().toString().c_str());
+  }
 #endif
 }
 
@@ -244,11 +253,19 @@ void loop() {
 #ifdef TOUCH_ENABLE
   touchHandler.isTouched();
 #endif
-#ifndef NM_WIRED
+  if (g_wired)
+  {
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    return;
+  }
   wifiManagerProcess(); // avoid delays() in loop when non-blocking and other long running code
+
+#ifdef NM_WIRED
+  //Wi-Fi mode but the relay is talking on the wire: reboot into wired mode
+  wired_watch();
 #endif
 
-#if defined(NM_TURBO) && !defined(NM_WIRED)
+#ifdef NM_TURBO
   ArduinoOTA.handle();
   WiFiClient c = statusServer.available();
   if (c)

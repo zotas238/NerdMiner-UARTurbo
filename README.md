@@ -8,8 +8,8 @@ A fork of [NerdMiner_v2](https://github.com/BitMaker-hub/NerdMiner_v2) (v1.8.3) 
 | Build | Clock | Hashrate (LilyGo T-Display S3) |
 |---|---|---|
 | Stock NerdMiner v1.8.3, Wi-Fi | 240 MHz | 205-232 kH/s |
-| Turbo, Wi-Fi (`NerdminerV2-Turbo`) | 240 MHz | ~480 kH/s |
-| Wired (`NerdminerV2-Wired`) | 240 MHz | ~485 kH/s* |
+| UARTurbo, Wi-Fi mode | 240 MHz | ~480 kH/s |
+| UARTurbo, wired mode | 240 MHz | ~485 kH/s* |
 | Wired, overclocked | 280 MHz | ~640-646 kH/s |
 | Wired, overclocked | **300 MHz** | **~700 kH/s** |
 
@@ -20,6 +20,17 @@ A fork of [NerdMiner_v2](https://github.com/BitMaker-hub/NerdMiner_v2) (v1.8.3) 
 > **Warning:** the overclock reprograms undocumented ESP32-S3 PLL registers. It worked on one board; yours may differ (silicon lottery). Several safety nets are built in (below), but you do this at your own risk.
 
 ---
+
+## One firmware, two modes
+
+The board picks its mode at every boot, by itself:
+
+- **Wired mode** when a host is wired to the UART: a host's TX line idles high, so with the chip's own pull-down on, GPIO44 (board RX) reads high only when something drives it. Wi-Fi stays off, work comes from the relay, and the relay may overclock it.
+- **Wi-Fi mode** when GPIO44 is left unconnected: normal NerdMiner Wi-Fi setup and stratum at the stock 240 MHz, with OTA updates and a JSON status on port 80.
+
+If a board booted in Wi-Fi mode later hears work from the relay on the wire, it reboots into wired mode. A `D` on the wire in the first 300 ms after boot reboots into the ROM download mode in either mode.
+
+The screen shows the hashrate, the best share ever (kept in flash across reboots and updates), the best share since this boot and the chip temperature, plus the Wi-Fi signal (dBm) in Wi-Fi mode.
 
 ## Why a wire? Why no Wi-Fi?
 
@@ -39,7 +50,7 @@ The relay also re-checks every share the board finds before submitting it, so a 
 
 ### The board
 
-**Tested:** LilyGo **T-Display S3** (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM). The `NerdminerV2-Wired` env builds for exactly this board.
+**Tested:** LilyGo **T-Display S3** (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM). The `NerdminerV2-Wired` env builds for exactly this board (`NerdminerV2-Turbo` builds the same firmware; it only differs in uploading over Wi-Fi OTA).
 
 **Other ESP32-S3 boards:** probably workable, but untested. Everything that makes this fast (SHA engine driver, PLL overclock, UART0 on the crystal) is ESP32-S3 silicon, not board-specific. To port it:
 - create a PlatformIO env for your board (start from its upstream env), add `board_build.partitions = partitions_turbo.csv`, `build_unflags = -Os`, and `-O2 -D NM_TURBO=1 -D NM_WIRED=1` to its build flags;
@@ -95,7 +106,7 @@ pio run -e NerdminerV2-Wired
 #    .pio/build/NerdminerV2-Wired/firmware.elf          (keep it: needed to decode crashes)
 ```
 
-(The build reads an env var `NM_OTA_PASS` for the Wi-Fi Turbo build's OTA password. The wired build doesn't use it, so leave it unset.)
+(The build reads an env var `NM_OTA_PASS` for the OTA password used in Wi-Fi mode. Unset means OTA without a password.)
 
 ### 2. First flash, over USB (one time only)
 
@@ -221,13 +232,13 @@ Wire protocol (board side, `runWiredWorker` in `src/mining.cpp`): relay → boar
 
 ## How the speed-up works (short version)
 
-- **HW miner** (≈ 90 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits anchored on a load, and moves digests with PIE 128-bit loads/stores: ~1200 → ~541 CPU cycles per nonce. **Turbo8** (wired build): about 400 of those cycles were the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word, any peripheral), and the S3 splits 128-bit accesses to peripherals into single transfers by default (`SENSITIVE_APB_PERIPHERAL_ACCESS_SPLIT_BURST`). Clearing it around the mining loop makes the digest moves and register stores cheaper: ~541 → ~468 cycles per nonce. It is used only if 4096 nonces match mbedTLS with it and it benches faster at boot; status `t5.sb` = [cycles ×10 with it, without it, code: 1 used, 2 last trial hung, 3 self-test failed, 4 not faster, 5 off after a crash]. **Turbo9** (wired build): the second hash of each nonce after the first in a batch is started without the anchor load; interrupts are masked around the START store and the wait is timed from its issue. ~466 → ~455 cycles per nonce (~700 kH/s raw at 300 MHz). Without the anchor the H7 read is occasionally early (~0.7% of those nonces at the boot-picked wait): such a nonce is lost, and a false candidate from it is counted in `t5.nb[9]` (false candidates) against `t5.nb[10]` (those nonces / 65536), not as an engine fault. Estimated loss = nb[9] / nb[10]; NB switches itself off if it passes 1%. Net gain over Turbo8 is about 1%. The 8-nonce checks every 8th job still compare against mbedTLS. Every variant is self-tested against mbedTLS at boot, and the fastest passing one is picked.
+- **HW miner** (≈ 90 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits anchored on a load, and moves digests with PIE 128-bit loads/stores: ~1200 → ~541 CPU cycles per nonce. **Turbo8** (wired mode): about 400 of those cycles were the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word, any peripheral), and the S3 splits 128-bit accesses to peripherals into single transfers by default (`SENSITIVE_APB_PERIPHERAL_ACCESS_SPLIT_BURST`). Clearing it around the mining loop makes the digest moves and register stores cheaper: ~541 → ~468 cycles per nonce. It is used only if 4096 nonces match mbedTLS with it and it benches faster at boot; status `t5.sb` = [cycles ×10 with it, without it, code: 1 used, 2 last trial hung, 3 self-test failed, 4 not faster, 5 off after a crash]. **Turbo9** (wired mode): the second hash of each nonce after the first in a batch is started without the anchor load; interrupts are masked around the START store and the wait is timed from its issue. ~466 → ~455 cycles per nonce (~700 kH/s raw at 300 MHz). Without the anchor the H7 read is occasionally early (~0.7% of those nonces at the boot-picked wait): such a nonce is lost, and a false candidate from it is counted in `t5.nb[9]` (false candidates) against `t5.nb[10]` (those nonces / 65536), not as an engine fault. Estimated loss = nb[9] / nb[10]; NB switches itself off if it passes 1%. Net gain over Turbo8 is about 1%. The 8-nonce checks every 8th job still compare against mbedTLS. Every variant is self-tested against mbedTLS at boot, and the fastest passing one is picked.
 - **SW miner** on the other core: double SHA-256 in generated, list-scheduled Xtensa assembly with schedule/round precompute: 6918 → 5449 cycles per nonce.
 - **Wired:** stratum moves off the chip, the UART goes onto the crystal, and the BBPLL feedback divider is reprogrammed at run time following ESP-IDF's own PLL sequence (MSPI to low speed, CPU on the crystal, recalibrate, wait for lock, gentle return). That's in `src/turbo/turbo_pll.cpp`; the hashrate scales linearly with the clock.
 
 Main files: `src/turbo/turbo_hw.cpp` (HW engine), `src/turbo/sha256_sw*.{cpp,S,inc}` + `gen_sw_asm.py` (SW miner), `src/turbo/turbo_pll.cpp` (overclock), `src/mining.cpp` → `runWiredWorker` (wire protocol), `wired/` (relay and tools).
 
-The Wi-Fi Turbo build (`pio run -e NerdminerV2-Turbo`, ~480 kH/s at stock clock) needs no wire. It adds ArduinoOTA and a JSON status on port 80.
+In Wi-Fi mode (no wire, ~480 kH/s at stock clock) the firmware adds ArduinoOTA and a JSON status on port 80; update it there with `pio run -e NerdminerV2-Turbo -t upload`.
 
 ## Credits & license
 

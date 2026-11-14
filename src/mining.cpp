@@ -82,6 +82,42 @@ volatile uint32_t valids; // increased if blockhash <= target
 // Track best diff
 double best_diff = 0.0;
 
+#ifdef NM_TURBO
+//Best share difficulty ever (own NVS key, kept whatever saveStats says) and since this boot
+double best_ever = 0.0;
+double best_session = 0.0;
+
+void turbo_best_begin()
+{
+  nvs_handle_t h;
+  size_t n = sizeof(best_ever);
+  if (nvs_open("uarturbo", NVS_READONLY, &h) == ESP_OK)
+  {
+    nvs_get_blob(h, "best_ever", &best_ever, &n);
+    nvs_close(h);
+  }
+  if (!(best_ever >= 0.0 && best_ever < 1e30))
+    best_ever = 0.0;
+}
+
+void turbo_best_note(double d)
+{
+  if (d > best_diff) best_diff = d;
+  if (d > best_session) best_session = d;
+  if (d > best_ever)
+  {
+    best_ever = d;
+    nvs_handle_t h;
+    if (nvs_open("uarturbo", NVS_READWRITE, &h) == ESP_OK)
+    {
+      nvs_set_blob(h, "best_ever", &best_ever, sizeof(best_ever));
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+}
+#endif
+
 // Variables to hold data from custom textboxes
 //Track mining stats in non volatile memory
 extern TSettings Settings;
@@ -451,8 +487,12 @@ void runStratumWorker(void *name) {
                                         auto itt = s_submition_map.find(id);
                                         if (itt != s_submition_map.end())
                                         {
+                                          #ifdef NM_TURBO
+                                          turbo_best_note(itt->second->diff);
+                                          #else
                                           if (itt->second->diff > best_diff)
                                             best_diff = itt->second->diff;
+                                          #endif
                                           if (itt->second->is32bit)
                                             shares++;
                                           if (itt->second->isValid)
@@ -1438,7 +1478,7 @@ String turboStatusJson()
     "{\"fw\":\"turbo\",\"ms\":%lu,\"up\":%llu,\"hw\":%u,\"sw\":%u,\"khs\":%u,"
     "\"shares\":%u,\"valids\":%u,\"best\":%.6g,\"templates\":%u,\"pool\":%s,%s,"
     "\"swv\":\"%s\",\"sw_cpn\":[%u,%u,%u,%u],\"sw_cand\":%u,\"sw_bad\":%u,"
-    "\"loops\":%u,\"hw_starved\":%u,\"sw_starved\":%u,\"temp\":%.1f,\"rssi\":%d,\"heap\":%u,\"asm_chk\":[%u,%u,%u],\"rr\":%d"
+    "\"wired\":%s,\"best_ever\":%.6g,\"best_session\":%.6g,\"loops\":%u,\"hw_starved\":%u,\"sw_starved\":%u,\"temp\":%.1f,\"rssi\":%d,\"heap\":%u,\"asm_chk\":[%u,%u,%u],\"rr\":%d"
     #ifdef NM_TURBO_PROBES
     ",\"probe\":%s"
     #endif
@@ -1448,6 +1488,7 @@ String turboStatusJson()
     (client.connected() && isMinerSuscribed) ? "true" : "false", hw,
     g_sw_variant >= 0 ? turbo_sw_variants[g_sw_variant].name : "none",
     (unsigned)g_sw_cpn[0], (unsigned)g_sw_cpn[1], (unsigned)g_sw_cpn[2], (unsigned)g_sw_cpn[3], (unsigned)g_sw_cands, (unsigned)g_sw_bad,
+    g_wired ? "true" : "false", best_ever, best_session,
     (unsigned)g_strat_loops, (unsigned)g_hw_starved, (unsigned)g_sw_starved,
     temperatureRead(), (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), (unsigned)g_asm_chk, (unsigned)g_asm_got, (unsigned)g_asm_want, (int)esp_reset_reason()
     #ifdef NM_TURBO_PROBES
@@ -1459,8 +1500,17 @@ String turboStatusJson()
 #endif
 
 #ifdef NM_TURBO
+#ifdef NM_WIRED
+static volatile uint32_t s_wired_last_job_ms = 0;
+#endif
 bool turboPoolUp()
 {
+#ifdef NM_WIRED
+  //wired: the relay only sends work while it is subscribed and authorized at the pool,
+  //and refreshes it every 30 s, so recent work means the pool is up
+  if (g_wired)
+    return s_wired_last_job_ms != 0 && millis() - s_wired_last_job_ms < 90000;
+#endif
   return client.connected() && isMinerSuscribed;
 }
 #endif
@@ -1540,6 +1590,64 @@ static void wired_status()
                  (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id);
 }
 
+bool g_wired = false;
+
+//Wired or Wi-Fi, decided at boot. A host's UART TX idles high, so with the pin's own
+//pull-down on, GPIO44 (board RX) reads high only when a host is wired to it; left
+//unconnected it reads low. A Wi-Fi-mode board that later hears the relay (wired_watch)
+//leaves a note in RTC memory and reboots, and the note makes the next boot wired.
+#define WIRED_NOTE 0x57495245
+static RTC_NOINIT_ATTR uint32_t s_wired_note;
+bool wired_detect()
+{
+  if (s_wired_note == WIRED_NOTE && esp_reset_reason() == ESP_RST_SW)
+  {
+    s_wired_note = 0;
+    Serial.printf("[WIRED] relay heard last boot: wired mode\n");
+    return true;
+  }
+  s_wired_note = 0;
+  pinMode(44, INPUT_PULLDOWN);
+  delay(2);
+  int high = 0;
+  for (int i = 0; i < 40; ++i)
+  {
+    high += digitalRead(44);
+    delayMicroseconds(100);
+  }
+  //a byte arriving meanwhile pulls some samples low: a mostly-high line is still a host
+  bool wired = high >= 30;
+  Serial.printf("[WIRED] GPIO44 high %d/40: %s mode\n", high, wired ? "wired" : "Wi-Fi");
+  return wired;
+}
+
+//Wi-Fi mode: watch the wire. Work from the relay ("J ...") means it is wired after all.
+void wired_watch()
+{
+  static char buf[4];
+  static size_t n = 0;
+  while (Serial0.available())
+  {
+    int c = Serial0.read();
+    if (c == 0x0A || c == 0x0D)
+    {
+      bool job = n >= 2 && buf[0] == 0x4A && buf[1] == 0x20;
+      bool dl = n == 1 && buf[0] == 0x44;
+      n = 0;
+      if (job || dl)
+      {
+        Serial0.printf("%s\n", dl ? "d" : "B relay heard in Wi-Fi mode, rebooting wired");
+        Serial0.flush();
+        if (dl) REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+        else s_wired_note = WIRED_NOTE;
+        esp_restart();
+      }
+    }
+    else if (n < sizeof(buf))
+      buf[n++] = (char)c;
+  }
+}
+
 //Called first thing in setup(): 300 ms in which a "D" on the wire reboots into the ROM
 //download mode, so a firmware that crashes later in boot can still be reflashed remotely
 void wired_boot_window()
@@ -1569,7 +1677,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v6 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v7 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1631,6 +1739,7 @@ void runWiredWorker(void *name)
               sha_hal_read_digest(SHA2_256, hw_midstate);
               esp_sha_release_hardware();
               nonce_pool = 0;
+              s_wired_last_job_ms = millis();
               mMonitor.NerdStatus = NM_Connecting;
             }
           } else if (cmd == 0x50)   // P
@@ -1658,12 +1767,17 @@ void runWiredWorker(void *name)
             Serial0.printf("q %u %d %u cal=%u lock=%u fb=%u now=%u r8=%02x\n", (unsigned)div, ok ? 1 : 0, (unsigned)us, (unsigned)c, (unsigned)l, (unsigned)f, (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_r8());
           } else if (cmd == 0x41)   // A
           {
-            double d = atof(line + 2);
-            if (d > best_diff) best_diff = d;
+            turbo_best_note(atof(line + 2));
             shares++;
             if (millis() > 10UL * 60 * 1000) turbo_crash_guard_stable();
           } else if (cmd == 0x53)   // S
             wired_status();
+          else if (cmd == 0x4D)     // M <diff>: raise the best-ever share (e.g. carry it over from the relay's logs)
+          {
+            turbo_best_note(atof(line + 2));
+            best_session = 0.0;   // the session best only counts shares found since boot
+            wired_status();
+          }
           else if (cmd == 0x44)     // D
           {
             Serial0.printf("d\n");
