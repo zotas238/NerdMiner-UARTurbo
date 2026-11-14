@@ -13,6 +13,9 @@
 #include "utils.h"
 #include <WiFi.h>
 #include <esp_timer.h>
+#ifdef NM_TURBO
+#include "../../turbo/turbo_pll.h"
+#endif
 
 #define WIDTH 340
 #define HEIGHT 170
@@ -99,12 +102,12 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
   tft.setTextPadding(0);
   tft.drawString("NerdMiner UARTurbo", 8, 6, 2);
-  //signal strength only means something in Wi-Fi mode
+  //top right: CPU clock; plus the signal strength in Wi-Fi mode
   tft.setTextPadding(110);
   if (g_wired)
-    line[0] = 0;
+    snprintf(line, sizeof(line), "%u MHz", (unsigned)turbo_pll_mhz());
   else
-    snprintf(line, sizeof(line), "%d dBm", (int)WiFi.RSSI());
+    snprintf(line, sizeof(line), "%u MHz  %d dBm", (unsigned)turbo_pll_mhz(), (int)WiFi.RSSI());
   tft.setTextDatum(TR_DATUM);
   tft.drawString(line, 312, 6, 2);
   tft.setTextDatum(TL_DATUM);

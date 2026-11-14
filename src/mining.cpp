@@ -1726,7 +1726,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v17 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v18 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage(), (unsigned)turbo_stress_last());
 
   double pool_diff = DEFAULT_DIFFICULTY;

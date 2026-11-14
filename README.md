@@ -28,7 +28,7 @@ The board picks its mode at every boot, by itself:
 
 If a board booted in Wi-Fi mode later hears work from the relay on the wire, it reboots into wired mode. A `D` on the wire in the first 300 ms after boot reboots into the ROM download mode in either mode.
 
-The screen shows the hashrate, the best share ever (kept in flash across reboots and updates), the best share since this boot and the chip temperature, plus the Wi-Fi signal (dBm) in Wi-Fi mode.
+The screen shows the hashrate, the CPU clock, the best share ever (kept in flash across reboots and updates), the best share since this boot, the chip temperature and the block height, plus the Wi-Fi signal (dBm) in Wi-Fi mode.
 
 ## Why a wire? Why no Wi-Fi?
 
