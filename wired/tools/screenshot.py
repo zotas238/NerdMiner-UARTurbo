@@ -47,7 +47,7 @@ raw = {}
 try:
     s = serial.Serial(port, a.baud, timeout=0.05)
     s.reset_input_buffer()
-    s.write(b"P 8 %d\n" % c.get("mode", 0)); time.sleep(0.3)   # stock 240 MHz while the bus is read
+    s.write(b"P 8 48\n"); time.sleep(0.3)   # stock 240 MHz while the bus is read (plain switch: no zones, no voltage)
     s.reset_input_buffer()
     s.write(b"F\n")
     buf, end, total = b"", time.time() + 20, None
@@ -65,7 +65,7 @@ try:
                 except ValueError:
                     pass   # a garbled line: that strip stays black
     if c.get("div", 8) != 8:
-        s.write(b"P %d %d\n" % (c["div"], c.get("mode", 0))); time.sleep(0.3)
+        s.write(b"P %d %d %d %d\n" % (c["div"], c.get("mode", 0), c.get("ref", 0), c.get("vdig", 0))); time.sleep(0.3)   # with the voltage 320 MHz needs
     s.close()
 finally:
     pause.unlink(missing_ok=True)
