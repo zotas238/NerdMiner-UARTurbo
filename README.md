@@ -175,9 +175,9 @@ Mode 48 adds the gentle switch (bit 32), which came after the 260/280 tests; 52 
 
 **Safety nets** (built in, nothing to set up):
 - **RTC watchdog** (8 s, runs off the RTC slow clock, not the PLL): a hard hang causes a full chip reset, which also puts the PLL and voltage back to stock.
-- **Relay step-down:** two crash resets at the configured setting within an hour make the relay lower `div` by one and save it in `oc.json` (`stepped_down` shows when).
-- **Crash guard:** two crash resets in a row put the firmware in a slow but safe engine (~275 kH/s, `"safe": true` in status). After fixing the cause, `echo Z >> .../cmd` clears it and reboots.
-- **Self-tests:** every fast SHA path is checked against mbedTLS at boot and spot-checked while mining (`bad` / `sw_bad` in status must stay 0); a failing path falls back to a slower one.
+- **No slow modes when wired:** there are two modes only, wired turbo (~700 kH/s at 300 MHz) and Wi-Fi (stock clock, lower hashrate). Wired, the board always runs the fastest engine (t5): after a crash it reboots straight back into it at the `oc.json` clock (the relay never steps the clock down), and a wrong engine hash costs only that nonce (counted in `bad`). If the t5 self-test fails at boot, the board retries it and then reboots.
+- **Relay takes the port back:** whenever the relay reopens the serial port (after `wireota.py`, `screenshot.py` or esptool) it re-applies the overclock 30 s later, so a reboot it didn't see can't leave the board on stock clock.
+- **Self-tests:** every fast SHA path is checked against mbedTLS at boot and spot-checked while mining (`bad` / `sw_bad` in status must stay 0). In Wi-Fi mode a failing path falls back to a slower one, and two crash resets in a row put the engine in a slow safe mode (`"safe": true`, cleared by `Z`).
 - **The relay re-hashes every share**, so a wrong result never reaches the pool.
 
 Core voltage: `echo V >> .../cmd` shows it (e.g. eFuse value 27 ≈ 1.19 V); `V 28` raises it, capped at 30 (1.25 V, ESP-IDF's 240 MHz value). The author's 300 MHz runs at stock; extra voltage did not rescue 320.
@@ -205,7 +205,10 @@ Write one per line to `<state>/cmd` (`echo S >> ~/.local/state/nerd-wired/cmd`).
 | `P <div> <mode>` | switch the PLL now (`P 8 0` = back to stock). Not saved; edit `oc.json` for that |
 | `Q <div> <mode>` | dry run: lock the PLL at div, switch straight back |
 | `V [n]` | read / set core voltage code (capped at 30) |
-| `Z` | clear the crash guard (safe mode) and reboot |
+| `Z` | clear the crash guard (Wi-Fi mode's safe mode) and reboot |
+| `W <s>` | screen redraw period in seconds (default 12, `0` = frozen). Status `"redraw"`: [period, last µs, max µs, count] |
+| `M <d> <d>` | set the best-ever share difficulty shown on the screen (value twice, both must match) |
+| `F` | screenshot: use `wired/tools/screenshot.py out.png` (drops to stock clock for the read-back, restores the overclock) |
 | `Y` | stream the last coredump (use `wired/tools/coredump_get.py <firmware.elf>`) |
 | `X` | dump BBPLL registers (now and at boot) |
 | `K <reg> <msb> <lsb> <val>` / `K` | extra BBPLL register writes for the next switch / clear them (experiments) |
@@ -224,7 +227,7 @@ Wire protocol (board side, `runWiredWorker` in `src/mining.cpp`): relay → boar
 | `serial open` but no `H` hello, `khs` null | TX/RX swapped, missing GND, or a bad joint on GPIO43 → host RX. Is the console/getty still on that UART? Did the first flash succeed? |
 | Hello OK, but no shares | Check `authorized True` (address/pool), and that the pool's difficulty isn't huge (`pool diff` lines in the log). |
 | `bad_cand` > 0, `rejected` climbing, frequent `boots` | Overclock too high for your chip: lower `div`, or add/remove mode bit 4 per the table. |
-| Hashrate ~275 kH/s, `"safe": true` | Crash guard tripped: fix the cause, then `Z`. |
+| Hashrate ~275 kH/s, `"safe": true` (Wi-Fi mode only) | Crash guard tripped: fix the cause, then `Z`. |
 | Board dead / boot loop / anything else | **USB recovery:** hold BOOT, plug USB into a computer, and do the first-flash steps again. The ROM bootloader lives in mask ROM, so it can always be reached this way. |
 | Hashrate collapses when the USB-C is plugged into a PC | A USB host that opens the board's CDC port and doesn't read it used to stall stock NerdMiner; Turbo sets a zero TX timeout, but a charger is still cleaner. |
 

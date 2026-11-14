@@ -44,8 +44,9 @@ static volatile uint32_t s_fail = 0xFFFFFFFF;   //first t4 self-test mismatch: s
 static inline uint32_t turbo_cycles() { return (uint32_t)(esp_timer_get_time() * 240); }
 
 //---------------------------------------------------------------------------------
-//Crash guard: survives resets (not power cycles); two crash resets in a row mean the
-//tuned engine misbehaves, so the next boot runs t1 only and stays reachable for OTA
+//Crash guard: survives resets (not power cycles); in Wi-Fi mode two crash resets in a row
+//mean the tuned engine misbehaves, so the next boot runs t1 only and stays reachable for OTA.
+//Wired mode has no slow modes: it always runs t5 (the wire stays reachable for OTA anyway).
 #define CRASH_MAGIC 0xC0FFEE42
 RTC_NOINIT_ATTR static uint32_t s_crash_magic;
 RTC_NOINIT_ATTR static uint32_t s_crash_count;
@@ -61,7 +62,7 @@ static void crash_guard_boot()
   }
   if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT)
     s_crash_count++;
-  s_safe_mode = s_crash_count >= 2;
+  s_safe_mode = !g_wired && s_crash_count >= 2;
   Serial.printf("[MINER] reset reason %d, crash count %u%s\n", (int)rr, (unsigned)s_crash_count, s_safe_mode ? ", safe mode" : "");
 }
 
@@ -1096,7 +1097,18 @@ void turbo_hw_init()
       s_t4_cpn_now = c;
     }
     const uint32_t now = s_mode == MODE_T4 ? c : s_t1_cpn[0];
-    const uint32_t c5 = t5_pick();
+    uint32_t c5 = t5_pick();
+#ifdef NM_WIRED
+    //wired: t5 or nothing; a failed pick is retried, then the board reboots and tries again
+    for (int i = 0; g_wired && !(c5 && c5 < now) && i < 3; ++i)
+      c5 = t5_pick();
+    if (g_wired && !(c5 && c5 < now))
+    {
+      Serial.printf("[MINER] t5 pick failed in wired mode, rebooting\n");
+      delay(100);
+      esp_restart();
+    }
+#endif
     s_t5_cpn = c5;
     if (c5 && c5 < now)
       s_mode = MODE_T5;
@@ -1139,6 +1151,13 @@ void turbo_hw_job(const JobRequest &job, JobResult &result, volatile uint8_t &cu
     s_t5.wn += T5_BUMP;
     Serial.printf("[MINER] t5 mismatch, delays now %u/%u\n", (unsigned)s_t5.wa, (unsigned)s_t5.wb);
   }
+#ifdef NM_WIRED
+  else if (c.bad && g_wired && s_mode == MODE_T5)
+  {
+    //wired stays on t5: every candidate is re-hashed in software before it is sent, so a
+    //wrong engine hash only costs that nonce (counted in "bad")
+  }
+#endif
   else if (c.bad)
   {
     //the engine got a hash wrong: one step down for the rest of this boot

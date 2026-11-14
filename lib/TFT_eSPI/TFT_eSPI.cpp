@@ -1270,6 +1270,24 @@ void TFT_eSPI::setCallback(getColorCallback getCol)
 ** Function name:           read rectangle (for SPI Interface II i.e. IM [3:0] = "1101")
 ** Description:             Read 565 pixel colours from a defined area
 ***************************************************************************************/
+#if defined(TFT_PARALLEL_8_BIT)
+// UARTurbo screenshots: open a read window and read bytes raw (after the dummy byte);
+// the caller decodes the controller's pixel format
+void TFT_eSPI::readRawBegin(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+  CS_L;
+  readAddrWindow(x, y, w, h);
+  busDir(GPIO_DIR_MASK, INPUT);
+  readByte();
+}
+uint8_t TFT_eSPI::readRawByte(void) { return readByte(); }
+void TFT_eSPI::readRawEnd(void)
+{
+  CS_H;
+  busDir(GPIO_DIR_MASK, OUTPUT);
+}
+#endif
+
 void TFT_eSPI::readRect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t *data)
 {
   PI_CLIP ;

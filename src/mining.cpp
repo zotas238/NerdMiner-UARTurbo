@@ -100,6 +100,19 @@ void turbo_best_begin()
     best_ever = 0.0;
 }
 
+void turbo_best_set(double d)
+{
+  if (!(d >= 0.0 && d < 1e30)) return;
+  best_ever = d;
+  nvs_handle_t h;
+  if (nvs_open("uarturbo", NVS_READWRITE, &h) == ESP_OK)
+  {
+    nvs_set_blob(h, "best_ever", &best_ever, sizeof(best_ever));
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
 void turbo_best_note(double d)
 {
   if (d > best_diff) best_diff = d;
@@ -1470,6 +1483,7 @@ void runMonitor(void *name)
 //One line of JSON for the status port: raw hash counters (rates are computed by the
 //reader from two samples), pool state and the HW self-test results
 bool turboPoolUp();
+extern volatile uint32_t g_redraw_s, g_draw_us, g_draw_us_max, g_draws;
 String turboStatusJson()
 {
   char hw[640];
@@ -1479,7 +1493,7 @@ String turboStatusJson()
     "{\"fw\":\"turbo\",\"ms\":%lu,\"up\":%llu,\"hw\":%u,\"sw\":%u,\"khs\":%u,"
     "\"shares\":%u,\"valids\":%u,\"best\":%.6g,\"templates\":%u,\"pool\":%s,%s,"
     "\"swv\":\"%s\",\"sw_cpn\":[%u,%u,%u,%u],\"sw_cand\":%u,\"sw_bad\":%u,"
-    "\"wired\":%s,\"best_ever\":%.6g,\"best_session\":%.6g,\"loops\":%u,\"hw_starved\":%u,\"sw_starved\":%u,\"temp\":%.1f,\"rssi\":%d,\"heap\":%u,\"asm_chk\":[%u,%u,%u],\"rr\":%d"
+    "\"wired\":%s,\"best_ever\":%.6g,\"best_session\":%.6g,\"redraw\":[%u,%u,%u,%u],\"loops\":%u,\"hw_starved\":%u,\"sw_starved\":%u,\"temp\":%.1f,\"rssi\":%d,\"heap\":%u,\"asm_chk\":[%u,%u,%u],\"rr\":%d"
     #ifdef NM_TURBO_PROBES
     ",\"probe\":%s"
     #endif
@@ -1490,6 +1504,7 @@ String turboStatusJson()
     g_sw_variant >= 0 ? turbo_sw_variants[g_sw_variant].name : "none",
     (unsigned)g_sw_cpn[0], (unsigned)g_sw_cpn[1], (unsigned)g_sw_cpn[2], (unsigned)g_sw_cpn[3], (unsigned)g_sw_cands, (unsigned)g_sw_bad,
     g_wired ? "true" : "false", best_ever, best_session,
+    (unsigned)g_redraw_s, (unsigned)g_draw_us, (unsigned)g_draw_us_max, (unsigned)g_draws,
     (unsigned)g_strat_loops, (unsigned)g_hw_starved, (unsigned)g_sw_starved,
     temperatureRead(), (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), (unsigned)g_asm_chk, (unsigned)g_asm_got, (unsigned)g_asm_want, (int)esp_reset_reason()
     #ifdef NM_TURBO_PROBES
@@ -1593,6 +1608,30 @@ static void wired_status()
 
 bool g_wired = false;
 
+//"<value> <value>": the relay sends a number twice; it counts only if both copies are
+//identical, so a byte lost on the wire can't turn 0.100568 into 100568
+void turbo_best_set(double d);
+static bool wired_twice(const char *p, double *out)
+{
+  while (*p == ' ') ++p;
+  const char *sp = strchr(p, ' ');
+  if (!sp || sp == p) return false;
+  const size_t n = sp - p;
+  if (strlen(sp + 1) != n || strncmp(p, sp + 1, n) != 0) return false;
+  *out = atof(p);
+  return true;
+}
+
+uint32_t turbo_screen_dump(void (*emit)(uint32_t off, const uint8_t *b, size_t n));
+static void wired_dump_emit(uint32_t off, const uint8_t *b, size_t n)
+{
+  static char hx[2 * 480 + 1];
+  for (size_t i = 0; i < n; ++i)
+    sprintf(hx + 2 * i, "%02x", b[i]);
+  Serial0.printf("f %u %s\n", (unsigned)off, hx);
+  nm_rtcwdt_feed();
+}
+
 //Wired or Wi-Fi, decided at boot. A host's UART TX idles high, so with the pin's own
 //pull-down on, GPIO44 (board RX) reads high only when a host is wired to it; left
 //unconnected it reads low. A Wi-Fi-mode board that later hears the relay (wired_watch)
@@ -1678,7 +1717,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v7 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v9 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1766,16 +1805,31 @@ void runWiredWorker(void *name)
             wired_uart_begin();
             turbo_pll_diag(&c, &l, &f);
             Serial0.printf("q %u %d %u cal=%u lock=%u fb=%u now=%u r8=%02x\n", (unsigned)div, ok ? 1 : 0, (unsigned)us, (unsigned)c, (unsigned)l, (unsigned)f, (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_r8());
-          } else if (cmd == 0x41)   // A
-          {
-            turbo_best_note(atof(line + 2));
+          } else if (cmd == 0x41)   // A <diff> <diff>: accepted share; the value is sent twice and
+          {                         // only counts as best if both copies agree (bytes lost on the wire)
+            double d;
+            if (wired_twice(line + 2, &d))
+              turbo_best_note(d);
             shares++;
             if (millis() > 10UL * 60 * 1000) turbo_crash_guard_stable();
           } else if (cmd == 0x53)   // S
             wired_status();
-          else if (cmd == 0x4D)     // M <diff>: raise the best-ever share (e.g. carry it over from the relay's logs)
+          else if (cmd == 0x57)     // W <s>: screen redraw period in seconds, 0 = frozen
           {
-            turbo_best_note(atof(line + 2));
+            uint32_t v = strtoul(line + 2, NULL, 10);
+            g_redraw_s = v > 600 ? 600 : v;
+            wired_status();
+          }
+          else if (cmd == 0x46)     // F: screenshot, raw frame bytes as "f <offset> <hex>", then "f end <bytes>"
+          {
+            uint32_t n = turbo_screen_dump(wired_dump_emit);
+            Serial0.printf("f end %u\n", (unsigned)n);
+          }
+          else if (cmd == 0x4D)     // M <diff> <diff>: set the best-ever share (e.g. carry it over from the
+          {                         // relay's logs, or correct it); both copies must agree
+            double d;
+            if (wired_twice(line + 2, &d))
+              turbo_best_set(d);
             best_session = 0.0;   // the session best only counts shares found since boot
             wired_status();
           }

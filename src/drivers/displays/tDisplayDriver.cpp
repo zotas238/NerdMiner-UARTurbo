@@ -12,6 +12,7 @@
 #include "rotation.h"
 #include "utils.h"
 #include <WiFi.h>
+#include <esp_timer.h>
 
 #define WIDTH 340
 #define HEIGHT 170
@@ -29,7 +30,12 @@ extern uint32_t Mhashes;
 extern uint32_t hashes;
 #include "mining.h"
 
-#define TURBO_REDRAW_S 5
+//Redraw period in seconds (0 = screen frozen), settable over the wire (W <s>). Each redraw
+//takes CPU time on core 1 from the software miner, so keep it rare.
+volatile uint32_t g_redraw_s = 12;
+//Last and longest redraw in microseconds, and the number of redraws, for the status line
+volatile uint32_t g_draw_us = 0, g_draw_us_max = 0, g_draws = 0;
+static SemaphoreHandle_t s_tft_lock = NULL;
 
 void tDisplay_Init(void)
 {
@@ -40,6 +46,29 @@ void tDisplay_Init(void)
   tft.init();
   tft.setRotation(ROTATION_90);
   tft.setSwapBytes(true);
+  s_tft_lock = xSemaphoreCreateMutex();
+}
+
+//Screenshot: read the frame back from the controller and hand it out raw, 3 bytes per pixel
+//as the ST7789 sends them (decoded by wired/tools/screenshot.py). Returns the byte count.
+uint32_t turbo_screen_dump(void (*emit)(uint32_t off, const uint8_t *b, size_t n))
+{
+  if (!s_tft_lock)
+    return 0;
+  xSemaphoreTake(s_tft_lock, portMAX_DELAY);
+  const uint32_t w = tft.width(), h = tft.height(), total = w * h * 3;
+  static uint8_t buf[480];
+  tft.readRawBegin(0, 0, w, h);
+  for (uint32_t off = 0; off < total; off += sizeof(buf))
+  {
+    const uint32_t n = total - off < sizeof(buf) ? total - off : sizeof(buf);
+    for (uint32_t i = 0; i < n; ++i)
+      buf[i] = tft.readRawByte();
+    emit(off, buf, n);
+  }
+  tft.readRawEnd();
+  xSemaphoreGive(s_tft_lock);
+  return total;
 }
 
 void tDisplay_MinerScreen(unsigned long mElapsed)
@@ -47,10 +76,11 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   static uint32_t calls = 0;
   static uint32_t last_ms = 0;
   static uint64_t last_hashes = 0;
-  if (calls++ % TURBO_REDRAW_S != 0)
-    return;
-
   uint32_t now = millis();
+  if (calls > 0 && (g_redraw_s == 0 || now - last_ms < g_redraw_s * 1000))
+    return;
+  calls++;
+
   uint64_t total = (uint64_t)Mhashes * 1000000ULL + hashes;
   float khs = 0;
   if (last_ms && now > last_ms && total >= last_hashes)
@@ -58,6 +88,9 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   last_ms = now;
   last_hashes = total;
 
+  if (s_tft_lock)
+    xSemaphoreTake(s_tft_lock, portMAX_DELAY);
+  const int64_t t0 = esp_timer_get_time();
   if (calls == 1)
     tft.fillScreen(TFT_BLACK);
 
@@ -93,6 +126,13 @@ void tDisplay_MinerScreen(unsigned long mElapsed)
   tft.drawString(line, 8, 114, 4);
   snprintf(line, sizeof(line), "Temp  %.0f C", temperatureRead());
   tft.drawString(line, 8, 140, 4);
+
+  const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+  if (s_tft_lock)
+    xSemaphoreGive(s_tft_lock);
+  g_draw_us = us;
+  if (us > g_draw_us_max) g_draw_us_max = us;
+  g_draws++;
 }
 
 #else

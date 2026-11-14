@@ -53,7 +53,7 @@ host, _, port = args.pool.rpartition(":")
 POOL = (host, int(port))
 USER = args.user
 # Overclock kept across boots, e.g. {"div": 11, "mode": 48} = 300 MHz (div 8 = stock 240 MHz). See README.
-# Sent OC_DELAY s after each boot. Two crash resets at that setting within an hour step it down by one and save that.
+# Sent OC_DELAY s after each boot and after the relay takes the port back. Never stepped down: a crash just reboots into it.
 OC_DELAY = 30
 JOB_REFRESH = 30          # s: new extranonce2 / ntime even without a notify
 DIFF1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -149,6 +149,7 @@ def main():
                 else:
                     port = args.port
                 ser = serial.Serial(port, args.baud, timeout=0.05); log("serial open", port); last_job = 0
+                oc_at = time.time() + OC_DELAY if oc_load().get("div", 8) != 8 else 0
                 main.last_lookup = None
             if pool.sock is None:
                 pool.connect()
@@ -167,7 +168,7 @@ def main():
                 elif m.get("id") in pool.pending:
                     d = pool.pending.pop(m["id"])
                     if m.get("result"):
-                        st["accepted"] += 1; ser.write(("A %.6g\n" % d).encode())
+                        st["accepted"] += 1; ser.write(("A %.6g %.6g\n" % (d, d)).encode())   # twice: the board checks both copies agree
                     else:
                         st["rejected"] += 1; log("rejected", m.get("error"))
             # new work
@@ -219,16 +220,8 @@ def main():
                         kv = dict(w.split("=", 1) for w in l.split() if "=" in w)
                         c = oc_load()
                         crashed_here = kv.get("last_try") == str(c.get("div")) or (kv.get("last_try") == "0" and time.time() - oc_applied < 600)
-                        if kv.get("rr") in ("4", "5", "6", "7", "9", "15") and crashed_here and c.get("div", 8) > 8:
-                            # one crash can be a fluke; two at the same setting within an hour step it down
-                            hist = [t for t in c.get("crashes", []) if time.time() - t < 3600] + [time.time()]
-                            c["crashes"] = hist
-                            if len(hist) >= 2:
-                                c["div"] -= 1; c["stepped_down"] = time.strftime("%F %T"); c["crashes"] = []
-                                log("crashed twice at the overclock, stepping down to div", c["div"])
-                            else:
-                                log("crashed once at the overclock, retrying it")
-                            oc_save(c)
+                        if kv.get("rr") in ("4", "5", "6", "7", "9", "15") and crashed_here:
+                            log("crashed at the overclock; it stays at div", c.get("div"), "(no step-down)")
                         oc_at = time.time() + OC_DELAY if c.get("div", 8) != 8 else 0
                     elif l.startswith(("p ", "q ", "v ", "k ", "x ", "b ", "y ", "z")):
                         st["pll_replies"] = (st["pll_replies"] + [l])[-10:]; log(l)

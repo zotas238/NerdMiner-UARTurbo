@@ -600,6 +600,10 @@ class TFT_eSPI : public Print { friend class TFT_eSprite; // Sprite class has ac
            // The next functions can be used as a pair to copy screen blocks (or horizontal/vertical lines) to another location
            // Read a block of pixels to a data buffer, buffer is 16-bit and the size must be at least w * h
   void     readRect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t *data);
+           // UARTurbo screenshots (parallel bus): raw bytes as the controller sends them
+  void     readRawBegin(int32_t x, int32_t y, int32_t w, int32_t h);
+  uint8_t  readRawByte(void);
+  void     readRawEnd(void);
            // Write a block of pixels to the screen which have been read by readRect()
   void     pushRect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t *data);
 
