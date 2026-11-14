@@ -190,7 +190,7 @@ No buttons, no USB, works while overclocked:
 python3 wired/tools/wireota.py --port /dev/ttyAMA0 NerdminerV2-Wired_firmware.bin
 ```
 
-It pauses the relay, streams the app image (~2-3 min), the board validates it and boots it, and the relay resumes. A broken transfer leaves the old firmware in place. Use the `_firmware.bin`, not the `_factory.bin`.
+It pauses the relay, streams the app image (~2-3 min), the board validates it and boots it, and the relay resumes. A broken transfer leaves the old firmware in place. Each chunk carries a CRC32 and the board refuses a damaged one, so bytes lost on the wire only cost a resend; if a board on older firmware writes a damaged chunk, the script starts the transfer over (up to 3 times). Use the `_firmware.bin`, not the `_factory.bin`.
 
 ---
 

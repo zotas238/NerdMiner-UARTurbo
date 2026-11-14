@@ -8,6 +8,7 @@
 //#include "ShaTests/nerdSHA256.h"
 #include "ShaTests/nerdSHA256plus.h"
 #include "stratum.h"
+#include <esp_rom_crc.h>
 #include "mining.h"
 #include "utils.h"
 #include "monitor.h"
@@ -1717,7 +1718,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v10 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v11 rr=%d pll=%u last_try=%u last_stage=%u\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1856,22 +1857,33 @@ void runWiredWorker(void *name)
             esp_err_t e = s_ota_part ? esp_ota_begin(s_ota_part, s_ota_size, &s_ota) : ESP_FAIL;
             if (e != ESP_OK) s_ota = 0;
             s_ota_off = 0;
-            Serial0.printf("o %d %s\n", e == ESP_OK ? 1 : 0, s_ota_part ? s_ota_part->label : "none");
-          } else if (cmd == 0x43)   // C <offset> <hex>
+            // "crc": chunks may carry a CRC32 (wireota.py then always sends one)
+            Serial0.printf("o %d %s crc\n", e == ESP_OK ? 1 : 0, s_ota_part ? s_ota_part->label : "none");
+          } else if (cmd == 0x43)   // C <offset> <hex> [crc32]
           {
+            // A byte lost on the wire must not get written: the hex must have an even length, and
+            // with a CRC32 (zlib's, 8 hex digits) the decoded chunk must match it
             char *q = line + 2;
             uint32_t off = strtoul(q, &q, 10);
             while (*q == 0x20) q++;
-            size_t n = strlen(q) / 2;
+            char *sp = strchr(q, ' ');
+            const size_t hl = sp ? (size_t)(sp - q) : strlen(q);
+            const size_t n = hl / 2;
             static uint8_t buf[512];
-            bool ok = s_ota && off == s_ota_off && n > 0 && n <= sizeof(buf);
+            bool ok = s_ota && off == s_ota_off && n > 0 && n <= sizeof(buf) && hl % 2 == 0;
             for (size_t i = 0; ok && i < n; ++i)
             {
               int hi = hexval(q[2 * i]), lo = hexval(q[2 * i + 1]);
               if (hi < 0 || lo < 0) ok = false; else buf[i] = (uint8_t)(hi << 4 | lo);
             }
+            if (ok && sp)
+            {
+              char *e2;
+              const uint32_t want = strtoul(sp + 1, &e2, 16);
+              ok = e2 - (sp + 1) == 8 && *e2 == 0 && esp_rom_crc32_le(0, buf, n) == want;
+            }
             if (ok && esp_ota_write(s_ota, buf, n) == ESP_OK) { s_ota_off += n; Serial0.printf("c %u\n", (unsigned)s_ota_off); }
-            else Serial0.printf("c! %u %u\n", (unsigned)off, (unsigned)s_ota_off);
+            else Serial0.printf("c! %u %u %u\n", (unsigned)off, (unsigned)s_ota_off, (unsigned)s_ota_off);
           } else if (cmd == 0x45)   // E: end, verify, boot it
           {
             esp_err_t e = (s_ota && s_ota_off == s_ota_size) ? esp_ota_end(s_ota) : ESP_FAIL;

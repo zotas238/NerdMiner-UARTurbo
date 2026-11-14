@@ -8,7 +8,7 @@ then resumes the relay. The board writes its spare OTA slot, esp_ota_end validat
 and only then does it boot it, so a cut-off transfer leaves the old firmware running.
 Use the *_firmware.bin (app image), not the *_factory.bin.
 """
-import argparse, hashlib, os, sys, time
+import argparse, hashlib, os, sys, time, zlib
 from pathlib import Path
 import serial
 
@@ -58,32 +58,78 @@ def reply(prefixes, t=5.0):
     return None
 
 
-try:
+CH = 512
+
+
+def board_offset(r):
+    """The board's write offset from a 'c N' / 'c! off N [N]' reply, or None if garbled.
+    Firmware with CRC support repeats N, and both copies must agree."""
+    w = r.split() if r else []
+    try:
+        if w[0] == "c" and len(w) == 2:
+            return int(w[1])
+        if w[0] == "c!" and len(w) == 3:
+            return int(w[2])
+        if w[0] == "c!" and len(w) == 4 and w[2] == w[3]:
+            return int(w[3])
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
+def transfer():
+    """One full pass: O, chunks, E. True when the board validated and accepted the image.
+    Bytes do get lost on the wire now and then. With CRC firmware the board refuses a bad
+    chunk and it's resent. Older firmware can take a chunk short a hex digit (it then sits
+    off a chunk boundary with bad data written); that pass is abandoned and started over."""
+    s.reset_input_buffer()
     s.write(f"O {len(fw)} {sha}\n".encode())
     r = reply(("o ",), 15)
     print("start:", r, flush=True)
     if not r or not r.startswith("o 1"):
         sys.exit("board did not start the update (is it running the wired firmware and wired right?)")
-    off, CH, t0, tries = 0, 512, time.time(), 0
+    crc = r.split()[-1] == "crc"
+    off, t0, stall, odd = 0, time.time(), 0, None
     while off < len(fw):
         chunk = fw[off:off + CH]
-        s.write(f"C {off} {chunk.hex()}\n".encode())
+        tail = f" {zlib.crc32(chunk):08x}" if crc else ""
+        s.write(f"C {off} {chunk.hex()}{tail}\n".encode())
         r = reply(("c ", "c!"), 3)
         if r == f"c {off + len(chunk)}":
-            off += len(chunk); tries = 0
+            off += len(chunk); stall = 0
             if off % (CH * 256) == 0:
                 print(f"  {off}/{len(fw)} {off / (time.time() - t0) / 1024:.1f} KB/s", flush=True)
             continue
-        tries += 1
+        stall += 1
+        b = board_offset(r)
         print("  retry at", off, r, flush=True)
-        if r and r.startswith("c! "):
-            want = int(r.split()[2])
-            if want <= off: off = want
-        if tries > 5:
-            sys.exit("too many retries")
+        if crc and off == 0 and stall >= 6:
+            print("  board refuses every CRC chunk: sending plain chunks", flush=True); crc = False
+        if stall > 40:
+            print("  no progress, starting over", flush=True); return False
+        if b is None or b > len(fw):
+            continue                       # garbled reply: send the chunk again
+        if b % CH and b != len(fw):
+            # the board took a chunk short of a digit: its image is bad from there on. Seen twice
+            # (not a garbled reply), start the whole transfer again.
+            if odd == b:
+                print(f"  board at {b}, off a chunk boundary: starting over", flush=True); return False
+            odd = b
+            continue
+        off = b                            # go to where the board is (a lost ack, or a resend)
     print(f"sent {len(fw)} bytes in {time.time() - t0:.0f} s", flush=True)
     s.write(b"E\n")
-    print("end:", reply(("e ",), 30), flush=True)
+    r = reply(("e ",), 30)
+    print("end:", r, flush=True)
+    return bool(r) and r.startswith("e 1")
+
+
+try:
+    for attempt in range(3):
+        if transfer():
+            break
+    else:
+        sys.exit("update failed 3 times; the old firmware is still running")
 finally:
     s.close()
     pause.unlink(missing_ok=True)
