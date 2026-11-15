@@ -619,8 +619,15 @@ static volatile uint32_t s_nb_chk = 0, s_nb_bad = 0, s_nb_bumps = 0;
 //v17: an early H7 read on an unanchored nonce while mining. Its value is unrelated to the
 //hash, so a false candidate (top 16 bits 0) shows 1 in 65536 of them: est. miss rate =
 //fc * 65536 / NB nonces. NB goes off if that passes 1% (it gains ~3%).
-static volatile uint32_t s_nb_fc = 0, s_nb_n16 = 0;   //false cands, NB nonces >> 16
+static volatile uint32_t s_nb_fc = 0, s_nb_n16 = 0;
+//v31 sampler: NB nonces sampled, early reads among them; the same with a zone switch in the wait
+static volatile uint32_t s_fcl[8] = {0}, s_fcn = 0, s_fcm[4] = {0};   //v33: last false cands (i << 8 | match), count; by match: n-1, n+1, n+-2, none
+static volatile uint32_t s_nb_es = 0, s_nb_er = 0, s_nb_esz = 0, s_nb_erz = 0, s_nb_eri[4] = {0};
+extern volatile uint32_t g_zone_n;
 #define NB_BUMP 4
+#define NB_DIAG 1   //NB stays on (no auto-off) while the false-candidate counters are watched
+#define NB_WNB 0       //wn bumps from the measured miss rate before NB goes off
+static volatile uint32_t s_nb_wnb = 0;
 #define NB_BUMPS 5     //NB mismatches before NB is switched off (anchored t5 stays)
 #define T5_CHECK_N 8   //nonces per mining check: the first anchored, the rest NB
 static volatile uint32_t s_t5_min[2] = {0};
@@ -643,6 +650,20 @@ static void t5_cand(Ctx *ctx, uint32_t nonce, uint32_t h7, bool nbn = false)
   {
     s_cands++;
     s_nb_fc++;   //costs this nonce only; the 8-nonce checks still guard the engine
+    //v33 diag: which nonce does this H7 belong to? (bit 0: nonce-1, bit 1: nonce+1, bit 2: nonce-2, bit 3: nonce+2)
+    {
+      uint32_t m = 0, x;
+      const int dd[4] = {-1, 1, -2, 2};
+      for (int k = 0; k < 4; ++k)
+      {
+        turbo_ref_sha256d(ctx->hdr, nonce + dd[k], hash);
+        memcpy(&x, hash + 28, 4);
+        if (x == h7) m |= 1u << k;
+      }
+      s_fcl[s_fcn & 7] = (nonce & 127) << 8 | m;
+      s_fcn++;
+      s_fcm[m & 15 ? (m & 1 ? 0 : m & 2 ? 1 : 2) : 3]++;
+    }
     return;
   }
   if (w7 != h7)
@@ -662,7 +683,7 @@ static void t5_cand(Ctx *ctx, uint32_t nonce, uint32_t h7, bool nbn = false)
 //to spin end, H7 load; then whole A and B loops per nonce
 static uint32_t s_prof[12];
 #define PCC(v) uint32_t v = 0; if (PROF) v = CCOUNT()
-template<bool ALL, bool PROF = false, bool NB = false>
+template<bool ALL, bool PROF = false, bool NB = false, bool SAMP = false>
 static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
 {
   uint32_t * const rb = (uint32_t *)DR_REG_SHA_BASE;
@@ -718,7 +739,10 @@ static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
       //NB (Turbo9): no anchor load. Interrupts masked from the drain to the START store,
       //so no ISR's leftover stores sit ahead of START; the wait is timed from its issue.
       //The first nonce of a batch keeps the anchor (TEXT was written by PIE moves).
-      const bool anc = !NB || i == 0;
+      //v35: the last nonce keeps it too: with no TEXT stores between its START and the H7
+      //read, the unanchored read gave a wrong H7 there (every NB false candidate was i 127)
+      const bool anc = !NB || i == 0 || i + 1 == cnt;
+      const uint32_t zn = SAMP ? g_zone_n : 0;
       if (anc)
       {
         RST(O_START, 1);
@@ -755,9 +779,23 @@ static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
         }
       }
       PCC(b3);
-      SPIN(t, (NB && i > 0) ? cfg.wn : (i + 1 < cnt ? cfg.wb : cfg.wl));
+      SPIN(t, (NB && i > 0 && i + 1 < cnt) ? cfg.wn : (i + 1 < cnt ? cfg.wb : cfg.wl));
       PCC(b4);
-      const uint32_t h7 = RLD(O_H(7));
+      uint32_t h7 = RLD(O_H(7));
+      if (SAMP && i > 0)
+      {
+        //v31 sampled job: every NB nonce read again after a whole block; a change means the
+        //first read was early. z: a zone switch (the other core stalls this one and changes
+        //the CPU clock) happened between this START and the reread
+        const uint32_t ts = CCOUNT();
+        SPIN(ts, cfg.wl);
+        const uint32_t h7b = RLD(O_H(7));
+        const bool z = g_zone_n != zn;
+        s_nb_es++;
+        if (z) s_nb_esz++;
+        if (h7b != h7) { s_nb_er++; if (z) s_nb_erz++; s_nb_eri[i >> 5]++; }
+        h7 = h7b;
+      }
       if (PROF)
       {
         const uint32_t b5 = CCOUNT();
@@ -780,6 +818,7 @@ static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
 }
 
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_run(T5_ARGS) { return s_nb ? t5_body<false, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<false>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
+static IRAM_ATTR __attribute__((noinline)) uint32_t t5_samp(T5_ARGS) { return t5_body<false, false, true, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_prof(T5_ARGS) { return s_nb ? t5_body<false, true, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_all(T5_ARGS) { return s_nb ? t5_body<true, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 
@@ -931,6 +970,70 @@ static IRAM_ATTR uint32_t ep_case(int kind, const uint32_t *tx, const uint32_t *
   return 999;
 }
 
+//v31 trace (relay g): what H7 / H0 read d cycles after the START (from the IV, kind 0) or
+//CONTINUE (H = midstate, kind 1) store issue, interrupts masked as in NB. Per d one char:
+//o old (H7 before the store), i IV word, f final, m midstate word, x anything else
+static IRAM_ATTR char tr_class(uint32_t v, uint32_t old, uint32_t fin, uint32_t iv, uint32_t m)
+{
+  return v == fin ? 'f' : v == old ? 'o' : v == iv ? 'i' : v == m ? 'm' : 'x';
+}
+static IRAM_ATTR void t5_trace_run(int kind, int word, uint32_t d0, uint32_t step, int n, char *out)
+{
+  uint32_t * const rb = (uint32_t *)DR_REG_SHA_BASE;
+  uint32_t tx[16], mid[8];
+  for (int i = 0; i < 16; ++i) tx[i] = 0x01234567u * (i + 3);
+  for (int i = 0; i < 8; ++i) mid[i] = 0x31415926u * (i + 7);
+  static const uint32_t IV[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  RST(O_MODE, SHA2_256);
+  //the final value: run once to the end
+  for (int i = 0; i < 16; ++i) ((volatile uint32_t *)rb)[(0x80 >> 2) + i] = tx[i];
+  if (kind) for (int i = 0; i < 8; ++i) ((volatile uint32_t *)rb)[(0x40 >> 2) + i] = mid[i];
+  MEMW();
+  if (kind) RST(O_CONT, 1); else RST(O_START, 1);
+  MEMW();
+  while (RLD(O_BUSY)) {}
+  const uint32_t fin = ((volatile uint32_t *)rb)[(0x40 >> 2) + word];
+  const uint32_t off = O_H(word);
+  for (int k = 0; k < n; ++k)
+  {
+    const uint32_t d = d0 + step * k;
+    //a different block first so the old H differs from the final
+    for (int i = 0; i < 16; ++i) ((volatile uint32_t *)rb)[(0x80 >> 2) + i] = ~tx[i];
+    MEMW();
+    RST(O_START, 1);
+    MEMW();
+    while (RLD(O_BUSY)) {}
+    for (int i = 0; i < 16; ++i) ((volatile uint32_t *)rb)[(0x80 >> 2) + i] = tx[i];
+    if (kind) for (int i = 0; i < 8; ++i) ((volatile uint32_t *)rb)[(0x40 >> 2) + i] = mid[i];
+    MEMW();
+    (void)RLD(O_BUSY);
+    const uint32_t old = ((volatile uint32_t *)rb)[(0x40 >> 2) + word];
+    uint32_t ps, v;
+    asm volatile("rsil %0, 3" : "=r"(ps) :: "memory");
+    MEMW();
+    if (kind) RST(O_CONT, 1); else RST(O_START, 1);
+    const uint32_t t = CCOUNT();
+    SPIN(t, d);
+    asm volatile("l32i %0, %1, 0" : "=r"(v) : "r"((uint32_t)rb + off) : "memory");
+    asm volatile("wsr %0, ps\n rsync" :: "r"(ps) : "memory");
+    MEMW();
+    while (RLD(O_BUSY)) {}
+    out[k] = tr_class(v, old, fin, IV[word], kind ? mid[word] : 0xFFFFFFFF);
+  }
+  out[n] = 0;
+}
+static int t5_trace(char *buf, size_t len)
+{
+  char a[4][72];
+  esp_sha_acquire_hardware();
+  t5_trace_run(0, 7, 0, 2, 70, a[0]);
+  t5_trace_run(0, 0, 0, 2, 70, a[1]);
+  t5_trace_run(1, 7, 0, 2, 70, a[2]);
+  t5_trace_run(1, 0, 0, 2, 70, a[3]);
+  esp_sha_release_hardware();
+  return snprintf(buf, len, "trace d0=0 step=2 S7 %s S0 %s C7 %s C0 %s", a[0], a[1], a[2], a[3]);
+}
+
 static void t5_engine_probe()
 {
   uint32_t * const rb = (uint32_t *)DR_REG_SHA_BASE;
@@ -1061,7 +1164,14 @@ static void t5_job(const JobRequest &job, JobResult &result, volatile uint8_t &c
   esp_sha_acquire_hardware();
   if (s_split0) bb_split(0);
   const bool nbr = s_nb;
-  result.nonce_count = t5_run(mid, w, job.nonce_start, job.nonce_start + job.nonce_count,
+  static uint32_t s_jn = 0;
+#ifdef NB_SAMP
+  const bool samp = nbr && ((s_jn++ & 31) == 5);
+#else
+  const bool samp = false;
+  (void)s_jn;
+#endif
+  result.nonce_count = (samp ? t5_samp : t5_run)(mid, w, job.nonce_start, job.nonce_start + job.nonce_count,
                               job.id & 0xFF, &cur_job, &c, nullptr, nullptr);
   if (nbr)
   {
@@ -1069,9 +1179,15 @@ static void t5_job(const JobRequest &job, JobResult &result, volatile uint8_t &c
     frac += result.nonce_count;
     s_nb_n16 += frac >> 16;
     frac &= 0xFFFF;
-    //miss rate > 1%: fc * 65536 > n / 100  <=>  fc * 100 > n16 (after 8 false cands)
-    if (s_nb_fc >= 8 && s_nb_fc * 100 > s_nb_n16)
-      s_nb = false;
+    //v30: miss rate > 0.5% (fc * 200 > n16, after 8 false cands): wn +4 and count again, up
+    //to NB_WNB times (each bump costs ~4 cycles of the ~11 NB saves); then NB off
+    if (s_nb_fc >= 8 && s_nb_fc * 200 > s_nb_n16)
+    {
+      if (s_nb_wnb < NB_WNB) { s_t5.wn += NB_BUMP; s_nb_wnb++; s_nb_fc = 0; s_nb_n16 = 0; frac = 0; }
+#ifndef NB_DIAG
+      else s_nb = false;
+#endif
+    }
   }
   if (s_split0) bb_split(1);
   esp_sha_release_hardware();
@@ -1084,6 +1200,64 @@ static bool s_t1_ok = false;
 #include "bus_bench.inc"
 #include "exp_bench.inc"
 #include "stress.inc"
+
+//v30 recal: the boot picks run at the stock 240 MHz, before the relay's P raises the clock.
+//Register accesses cost more CPU cycles at a higher clock (bus bench at PLL/3 vs PLL/2), so
+//the 240 MHz delays don't carry over: NB's wn ran into early reads at 320 and switched off.
+//After every P that succeeds, the HW miner reruns the picks at the new clock before its next
+//job (on its own core, like G). If the pick fails, the old config stays.
+static volatile int s_recal_req = 0;
+static volatile uint32_t s_recal_n = 0, s_recal_res = 0;   //recals done, last result (1 ok, 2 t5 pick failed)
+void turbo_hw_recal_request() { s_recal_req = 1; }
+static void t5_recal()
+{
+  const T5Cfg o_t5 = s_t5;
+  const bool o_nb = s_nb, o_sp = s_split0;
+  const uint32_t o_cpn = s_t5_cpn;
+  uint32_t o_nbst[4], o_prof[12];
+  memcpy(o_nbst, s_nbst, sizeof(o_nbst));
+  memcpy(o_prof, s_prof, sizeof(o_prof));
+  s_nb = false;
+  s_split0 = false;
+  x_feed();
+  const uint32_t c5 = t5_pick();
+  x_feed();
+  if (!c5)
+  {
+    s_t5 = o_t5; s_nb = o_nb; s_split0 = o_sp; s_t5_cpn = o_cpn;
+    memcpy(s_nbst, o_nbst, sizeof(o_nbst));
+    memcpy(s_prof, o_prof, sizeof(o_prof));
+    s_recal_res = 2;
+    s_recal_n++;
+    return;
+  }
+  s_t5_cpn = c5;
+  if (o_sp)
+  {
+    uint32_t c0 = 0xFFFFFFFF;
+    esp_sha_acquire_hardware();
+    for (int k = 0; k < 3; ++k)
+    {
+      bb_split(0);
+      const uint32_t c = bb_t5_cpn(8192, false, nullptr);
+      bb_split(1);
+      if (c < c0) c0 = c;
+    }
+    esp_sha_release_hardware();
+    s_sb[1] = c0;
+    s_split0 = true;
+    s_t5_cpn = (c0 + 5) / 10;
+  }
+  x_feed();
+  turbo_nb_pick();
+#ifdef NB_DIAG
+  if (!s_nb && s_nbst[0]) { s_nb = true; s_t5.wn = s_nbst[0] + 8; }
+#endif
+  s_t5_bumps = 0;
+  s_nb_fc = 0; s_nb_n16 = 0; s_nb_bumps = 0; s_nb_wnb = 0;
+  s_recal_res = 1;
+  s_recal_n++;
+}
 
 void turbo_hw_init()
 {
@@ -1132,8 +1306,14 @@ void turbo_hw_job(const JobRequest &job, JobResult &result, volatile uint8_t &cu
   if (s_xreq)
   {
     s_xreq = 0;
-    turbo_exp_bench(s_xbuf, s_xlen);
+    if (s_xkind == 1) t5_trace(s_xbuf, s_xlen);
+    else turbo_exp_bench(s_xbuf, s_xlen);
     s_xdone = 1;
+  }
+  if (s_recal_req)
+  {
+    s_recal_req = 0;
+    if (s_mode == MODE_T5) t5_recal();
   }
   Ctx c = {&result, job.sha_buffer, false};
   result.nonce_count = job.nonce_count;
@@ -1183,7 +1363,7 @@ int turbo_hw_status(char *buf, size_t len)
   return snprintf(buf, len,
     "\"mode\":\"%s\",\"safe\":%s,\"cpn\":%u,\"chk\":%u,\"cand\":%u,\"bad\":%u,\"t1\":[%u,%u],"
     "\"t4\":{\"da\":%u,\"db\":%u,\"pa\":%u,\"pb\":%u,\"v\":%u,\"min\":[%u,%u],\"cpn\":[%u,%u,%u,%u],\"fail\":%u},"
-    "\"t5\":{\"wa\":%u,\"wb\":%u,\"wl\":%u,\"min\":[%u,%u],\"cpn\":%u,\"h7chg\":%d,\"stage\":%u,\"fail\":%u,\"bumps\":%u,\"prof\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ep\":[%u,%u,%u,%u,%u],\"sb\":[%u,%u,%u],\"nb\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+    "\"t5\":{\"wa\":%u,\"wb\":%u,\"wl\":%u,\"min\":[%u,%u],\"cpn\":%u,\"h7chg\":%d,\"stage\":%u,\"fail\":%u,\"bumps\":%u,\"prof\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ep\":[%u,%u,%u,%u,%u],\"sb\":[%u,%u,%u],\"nb\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"rc\":[%u,%u,%u],\"es\":[%u,%u,%u,%u,%u,%u,%u,%u],\"fcm\":[%u,%u,%u,%u],\"fcl\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
     turbo_hw_mode_name(), s_safe_mode ? "true" : "false", (unsigned)cpn, (unsigned)s_checks,
     (unsigned)s_cands, (unsigned)s_bad, (unsigned)s_t1_cpn[0], (unsigned)s_t1_cpn[1],
     (unsigned)s_t4.da, (unsigned)s_t4.db, (unsigned)s_t4.pa, (unsigned)s_t4.pb, (unsigned)s_t4.v,
@@ -1195,7 +1375,12 @@ int turbo_hw_status(char *buf, size_t len)
     (unsigned)s_prof[9], (unsigned)s_prof[10], (unsigned)s_prof[11],
     (unsigned)s_ep[0], (unsigned)s_ep[1], (unsigned)s_ep[2], (unsigned)s_ep[3], (unsigned)s_ep[4],
     (unsigned)s_sb[0], (unsigned)s_sb[1], (unsigned)s_sb[2],
-    (unsigned)s_nb, (unsigned)s_nbst[0], (unsigned)s_nbst[1], (unsigned)s_nbst[2], (unsigned)s_nbst[3], (unsigned)s_t5.wn, (unsigned)s_nb_chk, (unsigned)s_nb_bad, (unsigned)s_nb_bumps, (unsigned)s_nb_fc, (unsigned)s_nb_n16);
+    (unsigned)s_nb, (unsigned)s_nbst[0], (unsigned)s_nbst[1], (unsigned)s_nbst[2], (unsigned)s_nbst[3], (unsigned)s_t5.wn, (unsigned)s_nb_chk, (unsigned)s_nb_bad, (unsigned)s_nb_bumps, (unsigned)s_nb_fc, (unsigned)s_nb_n16,
+    (unsigned)s_recal_n, (unsigned)s_recal_res, (unsigned)s_nb_wnb,
+    (unsigned)s_nb_es, (unsigned)s_nb_er, (unsigned)s_nb_esz, (unsigned)s_nb_erz,
+    (unsigned)s_nb_eri[0], (unsigned)s_nb_eri[1], (unsigned)s_nb_eri[2], (unsigned)s_nb_eri[3],
+    (unsigned)s_fcm[0], (unsigned)s_fcm[1], (unsigned)s_fcm[2], (unsigned)s_fcm[3],
+    (unsigned)s_fcl[0], (unsigned)s_fcl[1], (unsigned)s_fcl[2], (unsigned)s_fcl[3], (unsigned)s_fcl[4], (unsigned)s_fcl[5], (unsigned)s_fcl[6], (unsigned)s_fcl[7]);
 }
 
 #endif //NM_TURBO

@@ -21,4 +21,5 @@ int turbo_bus_bench(char *buf, size_t len);
 int turbo_stress(uint32_t k, uint32_t reps, uint32_t flags, char *buf, size_t len);
 uint32_t turbo_stress_last();
 int turbo_exp_bench(char *buf, size_t len);
-int turbo_exp_bench_core0(char *buf, size_t len);
+int turbo_exp_bench_core0(char *buf, size_t len, int kind = 0);
+void turbo_hw_recal_request();

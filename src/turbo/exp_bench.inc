@@ -217,15 +217,16 @@ static uint32_t x_check(const XVar &v, const T5Cfg c, int rounds)
   return bad;
 }
 
-static volatile int s_xreq = 0, s_xdone = 0;
+static volatile int s_xreq = 0, s_xdone = 0, s_xkind = 0;
 static char *s_xbuf = nullptr;
 static size_t s_xlen = 0;
 int turbo_exp_bench(char *buf, size_t len);
 //G from the wired task: the HW miner runs the bench on core 0 before its next job, so core 1
 //keeps mining and talking as it does while mining
-int turbo_exp_bench_core0(char *buf, size_t len)
+int turbo_exp_bench_core0(char *buf, size_t len, int kind)
 {
   buf[0] = 0;
+  s_xkind = kind;
   s_xbuf = buf; s_xlen = len; s_xdone = 0; s_xreq = 1;
   for (int k = 0; k < 1800 && !s_xdone; ++k) { x_feed(); vTaskDelay(pdMS_TO_TICKS(100)); }
   if (!s_xdone) { s_xreq = 0; return snprintf(buf, len, "x timeout"); }

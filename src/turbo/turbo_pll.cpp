@@ -356,7 +356,7 @@ uint32_t turbo_sysreg_poke(uint32_t addr, uint32_t mask, uint32_t val, uint32_t 
 static portMUX_TYPE s_zmux = portMUX_INITIALIZER_UNLOCKED;
 static DRAM_ATTR volatile uint8_t s_zone_on = 0;
 static DRAM_ATTR volatile int32_t s_zone_depth = 0;
-static DRAM_ATTR volatile uint32_t s_zone_n = 0;
+DRAM_ATTR volatile uint32_t g_zone_n = 0;   //zone switches (read by the t5 sampler)
 #define ZONE_FAST 2   // CPUPERIOD_SEL: PLL/2
 #define ZONE_SLOW 1   // PLL/3
 static inline void IRAM_ATTR zone_write(uint32_t sel)
@@ -367,7 +367,7 @@ static inline void IRAM_ATTR zone_write(uint32_t sel)
   REG_WRITE(SYSTEM_CPU_PER_CONF_REG, (per & ~SYSTEM_CPUPERIOD_SEL) | sel);
   spin(40);
   esp_cpu_unstall(other);
-  s_zone_n++;
+  g_zone_n++;
 }
 void IRAM_ATTR turbo_zone_enter()
 {
@@ -397,4 +397,4 @@ static void zone_park_slow()
   zone_write(ZONE_SLOW);
   portEXIT_CRITICAL(&s_zmux);
 }
-void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth) { *on = s_zone_on; *n = s_zone_n; *depth = s_zone_depth; }
+void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth) { *on = s_zone_on; *n = g_zone_n; *depth = s_zone_depth; }

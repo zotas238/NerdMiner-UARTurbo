@@ -1491,9 +1491,9 @@ bool turboPoolUp();
 extern volatile uint32_t g_redraw_s, g_draw_us, g_draw_us_max, g_draws;
 String turboStatusJson()
 {
-  char hw[640];
+  static char hw[900];   //v33: static (one caller in wired mode), more room for the diag fields
   turbo_hw_status(hw, sizeof(hw));
-  char buf[1400];
+  static char buf[1700];
   snprintf(buf, sizeof(buf),
     "{\"fw\":\"turbo\",\"ms\":%lu,\"up\":%llu,\"hw\":%u,\"sw\":%u,\"khs\":%u,"
     "\"shares\":%u,\"valids\":%u,\"best\":%.6g,\"templates\":%u,\"pool\":%s,%s,"
@@ -1726,7 +1726,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v18 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v24 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage(), (unsigned)turbo_stress_last());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1802,6 +1802,7 @@ void runWiredWorker(void *name)
             uint8_t vd = (uint8_t)strtoul(q, &q, 10);
             uint32_t us = 0;
             bool ok = turbo_pll_set(div, &us, mode, ref, vd);
+            if (ok) turbo_hw_recal_request();   //v30: delays picked again at the new clock
             wired_uart_begin();
             uint32_t c, l, f;
             turbo_pll_diag(&c, &l, &f);
@@ -1959,6 +1960,11 @@ void runWiredWorker(void *name)
             static char ub[900];
             turbo_bus_bench(ub, sizeof(ub));
             Serial0.printf("b %s\n", ub);
+          } else if (cmd == 0x67)   // g: v31 trace of H7/H0 after START/CONTINUE (on core 0)
+          {
+            static char gb[400];
+            turbo_exp_bench_core0(gb, sizeof(gb), 1);
+            Serial0.printf("b %s\n", gb);
           } else if (cmd == 0x47)   // G: Turbo9 loop experiments
           {
             static char xb[1200];
