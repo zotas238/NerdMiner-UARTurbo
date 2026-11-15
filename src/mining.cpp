@@ -1609,9 +1609,9 @@ static void wired_status()
   js.trim();
   if (js.endsWith("}"))
     js.remove(js.length() - 1);
-  Serial0.printf("T %s,\"pll\":%u,\"ref\":%u,\"mhz\":%u,\"vdig\":%u,\"pll_last_try\":%u,\"wired_id\":%u,\"zone\":[%u,%u,%d],\"psram\":[%u,%u,%u,%u]}\n", js.c_str(),
+  Serial0.printf("T %s,\"pll\":%u,\"ref\":%u,\"mhz\":%u,\"vdig\":%u,\"pll_last_try\":%u,\"wired_id\":%u,\"zone\":[%u,%u,%d,%u],\"psram\":[%u,%u,%u,%u]}\n", js.c_str(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_ref(), (unsigned)turbo_pll_mhz(), (unsigned)turbo_vdig_get(),
-                 (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id, (unsigned)zon, (unsigned)zn, (int)zd,
+                 (unsigned)turbo_pll_last_try(), (unsigned)s_wired_id, (unsigned)zon, (unsigned)zn, (int)zd, (unsigned)turbo_zone_ms(),
                  (unsigned)g_psram_fence[0], (unsigned)g_psram_fence[1], (unsigned)g_psram_fence[2], (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
@@ -1726,7 +1726,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v24 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v40 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage(), (unsigned)turbo_stress_last());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1744,7 +1744,10 @@ void runWiredWorker(void *name)
   while (true)
   {
    {
-    TurboZone _z;
+    //v49: zones only around the work that needs them (command parsing, share and status
+    //formatting). The loop runs 50 times a second; zoning all of it switched the clock
+    //~120 times a second, each switch stalling the HW miner's core
+    TurboZoneIf _z(Serial0.available() > 0);
     while (Serial0.available())
     {
       int c = Serial0.read();
@@ -1965,6 +1968,13 @@ void runWiredWorker(void *name)
             static char gb[400];
             turbo_exp_bench_core0(gb, sizeof(gb), 1);
             Serial0.printf("b %s\n", gb);
+          } else if (cmd == 0x77)   // w <wa> <wb> <wl> <wn>: t5 waits while mining (0 keeps one)
+          {
+            char *q = line + 1;
+            uint32_t v[4], o[4];
+            for (int k = 0; k < 4; ++k) v[k] = strtoul(q, &q, 10);
+            turbo_t5_waits(v[0], v[1], v[2], v[3], o);
+            Serial0.printf("w %u %u %u %u\n", (unsigned)o[0], (unsigned)o[1], (unsigned)o[2], (unsigned)o[3]);
           } else if (cmd == 0x47)   // G: Turbo9 loop experiments
           {
             static char xb[1200];
@@ -2038,11 +2048,16 @@ void runWiredWorker(void *name)
       std::shared_ptr<JobResult> res = job_result_list.front();
       job_result_list.pop_front();
       hashes += res->nonce_count;
-      if (res->difficulty > pool_diff && job_pool == res->id && res->nonce != 0xFFFFFFFF)
-        Serial0.printf("N %u %08x %.6g\n", (unsigned)s_wired_id, (unsigned)res->nonce, res->difficulty);
+      if (job_pool == res->id && res->nonce != 0xFFFFFFFF)
+      {
+        TurboZone _zn;
+        if (res->difficulty > pool_diff)
+          Serial0.printf("N %u %08x %.6g\n", (unsigned)s_wired_id, (unsigned)res->nonce, res->difficulty);
+      }
     }
     if (millis() - last_status >= 2000)
     {
+      TurboZone _zs;
       last_status = millis();
       wired_status();
     }

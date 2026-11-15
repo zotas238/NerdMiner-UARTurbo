@@ -37,3 +37,6 @@ void turbo_zone_exit();
 void turbo_zone_set(bool on);
 void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth);
 struct TurboZone { TurboZone() { turbo_zone_enter(); } ~TurboZone() { turbo_zone_exit(); } TurboZone(const TurboZone &) = delete; };
+//v49: a zone only when there is work for it (every zone stalls the other core twice and runs both cores at PLL/3)
+struct TurboZoneIf { const bool on; explicit TurboZoneIf(bool c) : on(c) { if (on) turbo_zone_enter(); } ~TurboZoneIf() { if (on) turbo_zone_exit(); } TurboZoneIf(const TurboZoneIf &) = delete; };
+uint32_t turbo_zone_ms();   //v49: total time spent in slow zones

@@ -23,3 +23,4 @@ uint32_t turbo_stress_last();
 int turbo_exp_bench(char *buf, size_t len);
 int turbo_exp_bench_core0(char *buf, size_t len, int kind = 0);
 void turbo_hw_recal_request();
+void turbo_t5_waits(uint32_t wa, uint32_t wb, uint32_t wl, uint32_t wn, uint32_t *out);

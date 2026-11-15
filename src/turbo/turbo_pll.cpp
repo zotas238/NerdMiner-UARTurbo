@@ -357,6 +357,7 @@ static portMUX_TYPE s_zmux = portMUX_INITIALIZER_UNLOCKED;
 static DRAM_ATTR volatile uint8_t s_zone_on = 0;
 static DRAM_ATTR volatile int32_t s_zone_depth = 0;
 DRAM_ATTR volatile uint32_t g_zone_n = 0;   //zone switches (read by the t5 sampler)
+static DRAM_ATTR volatile int64_t s_zone_t0 = 0, s_zone_us = 0;   //v49: time in slow zones
 #define ZONE_FAST 2   // CPUPERIOD_SEL: PLL/2
 #define ZONE_SLOW 1   // PLL/3
 static inline void IRAM_ATTR zone_write(uint32_t sel)
@@ -365,6 +366,9 @@ static inline void IRAM_ATTR zone_write(uint32_t sel)
   esp_cpu_stall(other);
   const uint32_t per = REG_READ(SYSTEM_CPU_PER_CONF_REG);
   REG_WRITE(SYSTEM_CPU_PER_CONF_REG, (per & ~SYSTEM_CPUPERIOD_SEL) | sel);
+  const int64_t now = esp_timer_get_time();
+  if (sel == ZONE_SLOW) s_zone_t0 = now;
+  else if (s_zone_t0) { s_zone_us += now - s_zone_t0; s_zone_t0 = 0; }
   spin(40);
   esp_cpu_unstall(other);
   g_zone_n++;
@@ -397,4 +401,5 @@ static void zone_park_slow()
   zone_write(ZONE_SLOW);
   portEXIT_CRITICAL(&s_zmux);
 }
+uint32_t turbo_zone_ms() { return (uint32_t)(s_zone_us / 1000); }
 void turbo_zone_info(uint32_t *on, uint32_t *n, int32_t *depth) { *on = s_zone_on; *n = g_zone_n; *depth = s_zone_depth; }

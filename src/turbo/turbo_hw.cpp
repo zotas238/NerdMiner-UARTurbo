@@ -1113,6 +1113,52 @@ static inline void bb_split(uint32_t v)
   (void)REG_READ(SENSITIVE_APB_PERIPHERAL_ACCESS_1_REG);
 }
 
+//v49 check stats: first failures, confirmed (failed twice), first failures with a zone switch
+//during the check, checks with a zone switch, last failure (k | 0x100 if the first digest was
+//right, i.e. H7 wrong | 0x10000 zone), rechecks that passed, uptime s of the last failure,
+//last confirmed failure
+static volatile uint32_t s_bd[8] = {0};
+static bool s_bd_chk = false;   //v51: this job's bad came from a check (s_bd[7] says which phase)
+static bool t5_check(const JobRequest &job, bool nb, uint32_t &nbad, uint32_t &info)
+{
+  static uint32_t out1[T5_CHECK_N][8], out7[T5_CHECK_N];
+  uint32_t mid[8], w[16];
+  memcpy(mid, job.midstate, sizeof(mid));
+  memcpy(w, job.sha_buffer + 64, sizeof(w));
+  const uint32_t z0 = g_zone_n;
+  esp_sha_acquire_hardware();
+  if (s_split0) bb_split(0);
+  t5_all(mid, w, job.nonce_start, job.nonce_start + T5_CHECK_N, 0, nullptr, nullptr, out1, out7);
+  if (s_split0) bb_split(1);
+  esp_sha_release_hardware();
+  const bool z = g_zone_n != z0;
+  if (z) s_bd[3]++;
+  nbad = 0;
+  for (int k = 0; k < T5_CHECK_N; ++k)
+  {
+    uint8_t b[80], h1[32], want[32];
+    memcpy(b, job.sha_buffer, 80);
+    const uint32_t nonce = job.nonce_start + k;
+    memcpy(b + 76, &nonce, 4);
+    mbedtls_sha256_ret(b, 80, h1, 0);
+    mbedtls_sha256_ret(h1, 32, want, 0);
+    uint32_t w7;
+    memcpy(&w7, want + 28, 4);
+    if (memcmp(h1, out1[k], 32) != 0 || w7 != out7[k])
+    {
+      const bool h1ok = memcmp(h1, out1[k], 32) == 0;
+      if (nb && k > 0 && h1ok)
+      {
+        nbad++;   //an early H7 read on an unanchored nonce: costs that nonce only
+        continue;
+      }
+      info = (uint32_t)k | (h1ok ? 0x100u : 0) | (z ? 0x10000u : 0);
+      return false;
+    }
+  }
+  return true;
+}
+
 static void t5_job(const JobRequest &job, JobResult &result, volatile uint8_t &cur_job, Ctx &c)
 {
   static uint32_t jobs = 0;
@@ -1121,33 +1167,26 @@ static void t5_job(const JobRequest &job, JobResult &result, volatile uint8_t &c
   memcpy(w, job.sha_buffer + 64, sizeof(w));
   if ((jobs++ & 7) == 0)
   {
-    static uint32_t out1[T5_CHECK_N][8], out7[T5_CHECK_N];
     const bool nb = s_nb;
-    esp_sha_acquire_hardware();
-    if (s_split0) bb_split(0);
-    t5_all(mid, w, job.nonce_start, job.nonce_start + T5_CHECK_N, 0, nullptr, nullptr, out1, out7);
-    if (s_split0) bb_split(1);
-    esp_sha_release_hardware();
     s_checks++;
     if (nb) s_nb_chk += T5_CHECK_N - 1;
-    uint32_t nbad = 0;
-    for (int k = 0; k < T5_CHECK_N; ++k)
+    uint32_t nbad = 0, info = 0;
+    //v49: a failed check runs again on the same nonces before it counts. Only a repeatable
+    //failure (a delay at the edge) is bad and bumps the delays; a one-off (e.g. a zone switch
+    //stalling this core and changing the clock under the engine) costs nothing
+    if (!t5_check(job, nb, nbad, info))
     {
-      uint8_t b[80], h1[32], want[32];
-      memcpy(b, job.sha_buffer, 80);
-      const uint32_t nonce = job.nonce_start + k;
-      memcpy(b + 76, &nonce, 4);
-      mbedtls_sha256_ret(b, 80, h1, 0);
-      mbedtls_sha256_ret(h1, 32, want, 0);
-      uint32_t w7;
-      memcpy(&w7, want + 28, 4);
-      if (memcmp(h1, out1[k], 32) != 0 || w7 != out7[k])
+      s_bd[0]++;
+      if (info & 0x10000) s_bd[2]++;
+      s_bd[4] = info;
+      s_bd[6] = (uint32_t)(esp_timer_get_time() / 1000000);
+      if (t5_check(job, nb, nbad, info))
+        s_bd[5]++;
+      else
       {
-        if (nb && k > 0 && memcmp(h1, out1[k], 32) == 0)
-        {
-          nbad++;   //an early H7 read on an unanchored nonce: costs that nonce only
-          continue;
-        }
+        s_bd[1]++;
+        s_bd[7] = info;
+        s_bd_chk = true;
         s_bad++;
         c.bad = true;
         result.nonce_count = 0;
@@ -1209,6 +1248,17 @@ static bool s_t1_ok = false;
 static volatile int s_recal_req = 0;
 static volatile uint32_t s_recal_n = 0, s_recal_res = 0;   //recals done, last result (1 ok, 2 t5 pick failed)
 void turbo_hw_recal_request() { s_recal_req = 1; }
+//v50 (relay w): set the t5 waits while mining (0 keeps one); bumps start over. The mining
+//checks (re-run once before they count) show whether a wait holds
+void turbo_t5_waits(uint32_t wa, uint32_t wb, uint32_t wl, uint32_t wn, uint32_t *out)
+{
+  if (wa) s_t5.wa = wa;
+  if (wb) s_t5.wb = wb;
+  if (wl) s_t5.wl = wl;
+  if (wn) s_t5.wn = wn;
+  if (wa || wb || wl || wn) s_t5_bumps = 0;
+  out[0] = s_t5.wa; out[1] = s_t5.wb; out[2] = s_t5.wl; out[3] = s_t5.wn;
+}
 static void t5_recal()
 {
   const T5Cfg o_t5 = s_t5;
@@ -1317,6 +1367,7 @@ void turbo_hw_job(const JobRequest &job, JobResult &result, volatile uint8_t &cu
   }
   Ctx c = {&result, job.sha_buffer, false};
   result.nonce_count = job.nonce_count;
+  s_bd_chk = false;
   switch (s_mode)
   {
     case MODE_T5: t5_job(job, result, cur_job, c); break;
@@ -1327,11 +1378,17 @@ void turbo_hw_job(const JobRequest &job, JobResult &result, volatile uint8_t &cu
   if (c.bad && s_mode == MODE_T5 && s_t5_bumps < T5_BUMPS)
   {
     //a delay too close to the edge: give both a little more and stay on t5
+    //v51: only the phase that failed: a wrong first digest is phase A (wa); a wrong H7 with the
+    //first digest right is phase B's anchored first (wb) or last (wl) nonce of the check batch
     s_t5_bumps++;
-    s_t5.wa += T5_BUMP;
-    s_t5.wb += T5_BUMP;
-    s_t5.wl += T5_BUMP;
-    s_t5.wn += T5_BUMP;
+    const uint32_t f = s_bd[7];
+    const bool fromchk = s_bd_chk;
+    s_bd_chk = false;
+    if (!fromchk) { s_t5.wa += T5_BUMP; s_t5.wb += T5_BUMP; s_t5.wl += T5_BUMP; s_t5.wn += T5_BUMP; }
+    else if (!(f & 0x100)) s_t5.wa += T5_BUMP;
+    else if ((f & 0xFF) == 0) s_t5.wb += T5_BUMP;
+    else if ((f & 0xFF) == T5_CHECK_N - 1) s_t5.wl += T5_BUMP;
+    else { s_t5.wb += T5_BUMP; s_t5.wl += T5_BUMP; s_t5.wn += T5_BUMP; }
     Serial.printf("[MINER] t5 mismatch, delays now %u/%u\n", (unsigned)s_t5.wa, (unsigned)s_t5.wb);
   }
 #ifdef NM_WIRED
@@ -1363,7 +1420,7 @@ int turbo_hw_status(char *buf, size_t len)
   return snprintf(buf, len,
     "\"mode\":\"%s\",\"safe\":%s,\"cpn\":%u,\"chk\":%u,\"cand\":%u,\"bad\":%u,\"t1\":[%u,%u],"
     "\"t4\":{\"da\":%u,\"db\":%u,\"pa\":%u,\"pb\":%u,\"v\":%u,\"min\":[%u,%u],\"cpn\":[%u,%u,%u,%u],\"fail\":%u},"
-    "\"t5\":{\"wa\":%u,\"wb\":%u,\"wl\":%u,\"min\":[%u,%u],\"cpn\":%u,\"h7chg\":%d,\"stage\":%u,\"fail\":%u,\"bumps\":%u,\"prof\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ep\":[%u,%u,%u,%u,%u],\"sb\":[%u,%u,%u],\"nb\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"rc\":[%u,%u,%u],\"es\":[%u,%u,%u,%u,%u,%u,%u,%u],\"fcm\":[%u,%u,%u,%u],\"fcl\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
+    "\"t5\":{\"wa\":%u,\"wb\":%u,\"wl\":%u,\"min\":[%u,%u],\"cpn\":%u,\"h7chg\":%d,\"stage\":%u,\"fail\":%u,\"bumps\":%u,\"prof\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ep\":[%u,%u,%u,%u,%u],\"sb\":[%u,%u,%u],\"nb\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"rc\":[%u,%u,%u],\"bd\":[%u,%u,%u,%u,%u,%u,%u,%u],\"es\":[%u,%u,%u,%u,%u,%u,%u,%u],\"fcm\":[%u,%u,%u,%u],\"fcl\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
     turbo_hw_mode_name(), s_safe_mode ? "true" : "false", (unsigned)cpn, (unsigned)s_checks,
     (unsigned)s_cands, (unsigned)s_bad, (unsigned)s_t1_cpn[0], (unsigned)s_t1_cpn[1],
     (unsigned)s_t4.da, (unsigned)s_t4.db, (unsigned)s_t4.pa, (unsigned)s_t4.pb, (unsigned)s_t4.v,
@@ -1377,6 +1434,7 @@ int turbo_hw_status(char *buf, size_t len)
     (unsigned)s_sb[0], (unsigned)s_sb[1], (unsigned)s_sb[2],
     (unsigned)s_nb, (unsigned)s_nbst[0], (unsigned)s_nbst[1], (unsigned)s_nbst[2], (unsigned)s_nbst[3], (unsigned)s_t5.wn, (unsigned)s_nb_chk, (unsigned)s_nb_bad, (unsigned)s_nb_bumps, (unsigned)s_nb_fc, (unsigned)s_nb_n16,
     (unsigned)s_recal_n, (unsigned)s_recal_res, (unsigned)s_nb_wnb,
+    (unsigned)s_bd[0], (unsigned)s_bd[1], (unsigned)s_bd[2], (unsigned)s_bd[3], (unsigned)s_bd[4], (unsigned)s_bd[5], (unsigned)s_bd[6], (unsigned)s_bd[7],
     (unsigned)s_nb_es, (unsigned)s_nb_er, (unsigned)s_nb_esz, (unsigned)s_nb_erz,
     (unsigned)s_nb_eri[0], (unsigned)s_nb_eri[1], (unsigned)s_nb_eri[2], (unsigned)s_nb_eri[3],
     (unsigned)s_fcm[0], (unsigned)s_fcm[1], (unsigned)s_fcm[2], (unsigned)s_fcm[3],
