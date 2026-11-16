@@ -34,3 +34,11 @@ uint32_t turbo_sw_asm_check(uint32_t count, uint32_t *got, uint32_t *want);
 //checking candidates before they are submitted
 void turbo_ref_sha256d(const uint8_t *hdr, uint32_t nonce, uint8_t *hash);
 bool turbo_ref_check(const uint8_t *hdr, uint32_t nonce, const uint8_t *hash);
+
+//v52 feed mode: the first hash only (sha256_sw_first.S, gen_sw_asm.py FIRST=1). out gets
+//the digest as the SHA engine holds it: 8 little-endian words of the digest bytes
+#ifdef ESP_PLATFORM
+extern "C" uint32_t turbo_sw_first_asm(const uint32_t *bake, uint32_t nonce, uint32_t *out);
+#endif
+//The first KAT header (80 bytes) and its bake, for self-tests
+void turbo_sw_kat_bake(uint8_t *hdr, uint32_t *bake);

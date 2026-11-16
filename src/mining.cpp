@@ -29,7 +29,7 @@
 #endif
 
 //10 Jobs per second
-#define NONCE_PER_JOB_SW 4096
+#define NONCE_PER_JOB_SW 16384   //v52: 4096 lasted 35 ms in feed mode
 #define NONCE_PER_JOB_HW 16*1024
 
 #ifdef NM_TURBO
@@ -734,7 +734,42 @@ void minerWorkerSw(void * task_id)
       uint8_t job_in_work = job->id & 0xFF;
       #ifdef NM_TURBO
       const TurboSwFn sw_hash = turbo_sw_hash;
+      if (g_feed_on)
+      {
+        //v52 feed mode: first hashes into the ring, the HW core does the second hash
+        uint32_t n = 0, hd = g_feed_head, spins = 0;
+        bool stop = false;
+        while (n < job->nonce_count && !stop)
+        {
+          while (hd - g_feed_tail >= TURBO_FEED_N)
+          {
+            if (s_working_current_job_id != job_in_work || !g_feed_on) { stop = true; break; }
+            if (++spins > 200000)
+            {
+              spins = 0;
+              esp_task_wdt_reset();
+              vTaskDelay(1);
+            }
+          }
+          if (stop) break;
+          TurboFeedE &e = g_feed[hd & (TURBO_FEED_N - 1)];
+          const uint32_t nonce = job->nonce_start + n;
+          turbo_sw_first_asm(job->bake, nonce, e.d);
+          e.nonce = nonce;
+          e.tag = job_in_work;
+          asm volatile("memw" ::: "memory");
+          g_feed_head = ++hd;
+          ++n;
+          if ((n & 0xFF) == 0 && (s_working_current_job_id != job_in_work || !g_feed_on))
+            break;
+        }
+        result->nonce_count = n;
+        g_sw_hashes += n;
+        g_fd_made += n;
+      }
+      else
       #endif
+      {
       for (uint32_t n = 0; n < job->nonce_count; ++n)
       {
         #ifdef NM_TURBO
@@ -770,6 +805,7 @@ void minerWorkerSw(void * task_id)
       #ifdef NM_TURBO
       g_sw_hashes += result->nonce_count;
       #endif
+      }
     } else
     {
       #ifdef NM_TURBO
@@ -1726,7 +1762,7 @@ void runWiredWorker(void *name)
   // PLL, regulator and BBPLL overrides all back to stock). Fed every pass of this loop.
   nm_rtcwdt_start(8000);
   wired_uart_begin();
-  Serial0.printf("\nH nerdminer-wired v40 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
+  Serial0.printf("\nH nerdminer-wired v43 rr=%d pll=%u last_try=%u last_stage=%u st=%08x\n", (int)esp_reset_reason(),
                  (unsigned)turbo_pll_get(), (unsigned)turbo_pll_last_try(), (unsigned)turbo_pll_last_stage(), (unsigned)turbo_stress_last());
 
   double pool_diff = DEFAULT_DIFFICULTY;
@@ -1975,6 +2011,22 @@ void runWiredWorker(void *name)
             for (int k = 0; k < 4; ++k) v[k] = strtoul(q, &q, 10);
             turbo_t5_waits(v[0], v[1], v[2], v[3], o);
             Serial0.printf("w %u %u %u %u\n", (unsigned)o[0], (unsigned)o[1], (unsigned)o[2], (unsigned)o[3]);
+          } else if (cmd == 0x66)   // f [0|1]: v52 feed mode off/on (no arg: state only)
+          {
+            static char fb[200];
+            char *q = line + 1;
+            while (*q == ' ') ++q;
+            int fa[4] = {-1, 0, 0, -1};
+            for (int k = 0; k < 4 && *q; ++k)
+            {
+              char *e;
+              long v = strtol(q, &e, 10);
+              if (e == q) break;
+              fa[k] = (int)v;
+              q = e;
+            }
+            turbo_feed_cmd(fa[0], fa[1] > 0 ? fa[1] : 0, fa[2] > 0 ? fa[2] : 0, fa[3], fb, sizeof(fb));
+            Serial0.printf("b %s\n", fb);
           } else if (cmd == 0x47)   // G: Turbo9 loop experiments
           {
             static char xb[1200];

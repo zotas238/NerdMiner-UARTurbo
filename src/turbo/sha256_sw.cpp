@@ -157,6 +157,14 @@ uint32_t turbo_sw_asm_check(uint32_t count, uint32_t *got, uint32_t *want)
   }
   return 0;
 }
+void turbo_sw_kat_bake(uint8_t *hdr, uint32_t *bake)
+{
+  unhex(hdr, kat_hex[0], 80);
+  uint32_t mid[8];
+  memcpy(mid, IV, sizeof(mid));
+  ref_compress(mid, hdr);
+  turbo_sw_bake(mid, hdr + 64, bake);
+}
 extern "C" bool turbo_sw_full_c(const uint32_t *bake, uint32_t nonce, uint8_t *hash)
 {
   return turbo_sw_sha256d_os(bake, nonce, hash);

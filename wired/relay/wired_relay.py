@@ -232,7 +232,7 @@ def main():
                         if kv.get("rr") in ("4", "5", "6", "7", "9", "15") and crashed_here:
                             log("crashed at the overclock; it stays at div", c.get("div"), "(no step-down)")
                         oc_at = time.time() + OC_DELAY if c.get("div", 8) != 8 else 0
-                    elif l.startswith(("p ", "q ", "v ", "k ", "x ", "b ", "y ", "z")):
+                    elif l.startswith(("p ", "q ", "v ", "k ", "x ", "b ", "y ", "w ", "z")):
                         st["pll_replies"] = (st["pll_replies"] + [l])[-10:]; log(l)
                     elif l.startswith(("B ", "d")):
                         log(l)

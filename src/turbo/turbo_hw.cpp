@@ -676,6 +676,127 @@ static void t5_cand(Ctx *ctx, uint32_t nonce, uint32_t h7, bool nbn = false)
   candidate(*ctx, nonce, hash);
 }
 
+//---------------------------------------------------------------------------------
+//v52 feed mode. Core 1 hashes the first block of its own nonces in software
+//(turbo_sw_first_asm, ~2760 cycles) instead of mining (5462 cycles/nonce); after each
+//batch the HW core runs phase B only on those digests (~150 cycles instead of 451). The
+//pass is phase B of t5_body with the ring as its source: the first and last entries
+//anchored, the rest NB when NB is on. A wrong H7 here only loses that nonce (counted in
+//fd fc, never a bump); candidates are re-hashed like all others.
+TurboFeedE g_feed[TURBO_FEED_N] __attribute__((aligned(16)));
+volatile uint32_t g_feed_head = 0, g_feed_tail = 0, g_feed_on = 0, g_fd_made = 0;
+static volatile uint32_t s_fd_ok = 0;     //0 not run, 1 passed, 2 + k failed at entry k
+static volatile uint32_t s_fd_want = 1;   //relay f
+static volatile uint32_t s_fd_n = 0, s_fd_cand = 0, s_fd_fc = 0, s_fd_drop = 0, s_fd_pass = 0, s_fd_max = 0;
+#define FEED_MAX 120   //v53: ring slots a pass may take at most (s_fd_maxn <= this)
+//v53 knobs (relay f on min max flags): a pass runs only when >= min entries wait; flags bit0:
+//the first entry of a pass unanchored too (scalar TEXT stores are ordered ahead of START)
+static volatile uint32_t s_fd_minn = 1, s_fd_maxn = 48, s_fd_flags = 0;
+//v53 live cycle accounting (HW core): in feed passes, in t5_run while mining, own nonces
+static uint64_t s_fd_cyc = 0, s_run_cyc = 0, s_run_n = 0;
+
+static void t5_fcand(Ctx *ctx, uint32_t nonce, uint32_t h7)
+{
+  uint8_t hash[32];
+  turbo_ref_sha256d(ctx->hdr, nonce, hash);
+  uint32_t w7;
+  memcpy(&w7, hash + 28, 4);
+  if (w7 != h7)
+  {
+    s_fd_fc++;
+    return;
+  }
+  s_fd_cand++;
+  candidate(*ctx, nonce, hash);
+}
+
+//8 digest words into TEXT 0..7 with scalar stores (they stay in order behind START)
+static inline __attribute__((always_inline)) void fd_text(uint32_t *rb, const uint32_t *sp)
+{
+  uint32_t a, b, c, d;
+  asm volatile("l32i %0, %4, 0\n l32i %1, %4, 4\n l32i %2, %4, 8\n l32i %3, %4, 12\n"
+               "s32i %0, %5, 0x80\n s32i %1, %5, 0x84\n s32i %2, %5, 0x88\n s32i %3, %5, 0x8c\n"
+               "l32i %0, %4, 16\n l32i %1, %4, 20\n l32i %2, %4, 24\n l32i %3, %4, 28\n"
+               "s32i %0, %5, 0x90\n s32i %1, %5, 0x94\n s32i %2, %5, 0x98\n s32i %3, %5, 0x9c\n"
+               : "=&r"(a), "=&r"(b), "=&r"(c), "=&r"(d) : "r"(sp), "r"(rb) : "memory");
+}
+
+//One pass over the ring. TEXT 8..15 must hold phase B's padding (true right after a
+//batch's phase B). out7: tests (H7 of every entry, no candidates). Returns entries done.
+template<bool NB, typename CFG>
+static inline __attribute__((always_inline)) uint32_t t5_feed(uint32_t *rb, const CFG &cfg, Ctx *ctx, uint8_t job_in_work,
+                                                               volatile uint8_t *cur_job, uint32_t *out7)
+{
+  const uint32_t M = TURBO_FEED_N - 1;
+  uint32_t tl = g_feed_tail;
+  const uint32_t hd = g_feed_head;
+  //entries of older jobs go; entries of the job this core takes next stay
+  while (tl != hd && g_feed[tl & M].tag != job_in_work && g_feed[tl & M].tag != *cur_job)
+  {
+    tl++;
+    s_fd_drop++;
+  }
+  //v54: no per-entry tag scan. Core 1 writes each job's entries in one run, so when the
+  //last entry of the span still has this job's tag, all before it do too. The span ends at
+  //the ring's end (pointer steps, no masking); the rest comes in the next pass
+  const uint32_t avail = hd - tl;
+  const uint32_t mx = out7 ? FEED_MAX : s_fd_maxn;
+  if (!avail || (!out7 && avail < s_fd_minn) || g_feed[tl & M].tag != job_in_work)
+  {
+    g_feed_tail = tl;
+    return 0;
+  }
+  uint32_t cnt = avail;
+  const uint32_t room = TURBO_FEED_N - (tl & M);
+  if (cnt > room) cnt = room;
+  if (cnt > mx) cnt = mx;
+  const TurboFeedE *e = &g_feed[tl & M];
+  if (e[cnt - 1].tag != job_in_work)
+  {
+    uint32_t c = 1;
+    while (c < cnt && e[c].tag == job_in_work) c++;
+    cnt = c;
+  }
+  const bool nb0 = NB && (s_fd_flags & 1);
+  const uint32_t wn = cfg.wn, wb = cfg.wb, wl = cfg.wl;
+  fd_text(rb, e[0].d);
+  MEMW();
+  for (uint32_t i = 0; i < cnt; ++i)
+  {
+    const bool last = i + 1 == cnt;
+    const bool anc = !NB || (i == 0 && !nb0) || last;
+    if (anc)
+    {
+      RST(O_START, 1);
+      MEMW();
+      (void)RLD(O_BUSY);
+    }
+    else
+    {
+      uint32_t ps;
+      asm volatile("rsil %0, 3" : "=r"(ps) :: "memory");
+      MEMW();
+      RST(O_START, 1);
+      asm volatile("wsr %0, ps\n rsync" :: "r"(ps) : "memory");
+    }
+    const uint32_t t = CCOUNT();
+    if (!last)
+      fd_text(rb, e[i + 1].d);
+    SPIN(t, !anc ? wn : (last ? wl : wb));
+    const uint32_t h7 = RLD(O_H(7));
+    if (out7)
+      out7[i] = h7;
+    else if (__builtin_expect((h7 >> 16) == 0, 0))
+      t5_fcand(ctx, e[i].nonce, h7);
+  }
+  MEMW();
+  g_feed_tail = tl + cnt;
+  s_fd_n += cnt;
+  s_fd_pass++;
+  if (cnt > s_fd_max) s_fd_max = cnt;
+  return cnt;
+}
+
 //Nonces [n, end): ALL stores the first digests in out1 and H7 of the second in out7
 //(tests); otherwise candidates go to ctx. Returns nonces done.
 //Profile of one bench run (PROF build of the loop): cycles summed over all nonces for
@@ -683,7 +804,7 @@ static void t5_cand(Ctx *ctx, uint32_t nonce, uint32_t h7, bool nbn = false)
 //to spin end, H7 load; then whole A and B loops per nonce
 static uint32_t s_prof[12];
 #define PCC(v) uint32_t v = 0; if (PROF) v = CCOUNT()
-template<bool ALL, bool PROF = false, bool NB = false, bool SAMP = false>
+template<bool ALL, bool PROF = false, bool NB = false, bool SAMP = false, bool FEED = false>
 static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
 {
   uint32_t * const rb = (uint32_t *)DR_REG_SHA_BASE;
@@ -807,6 +928,12 @@ static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
         t5_cand(ctx, n + i, h7, NB && i > 0);
     }
     if (PROF) s_prof[10] += CCOUNT() - pb0;
+    if (FEED && g_feed_on)
+    {
+      const uint32_t fc0 = CCOUNT();
+      t5_feed<NB>(rb, cfg, ctx, job_in_work, cur_job, nullptr);
+      s_fd_cyc += CCOUNT() - fc0;
+    }
     n += cnt;
     if (!ALL && *cur_job != job_in_work)
       break;
@@ -817,7 +944,7 @@ static inline __attribute__((always_inline)) uint32_t t5_body(T5_ARGS)
   return n - start;
 }
 
-static IRAM_ATTR __attribute__((noinline)) uint32_t t5_run(T5_ARGS) { return s_nb ? t5_body<false, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<false>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
+static IRAM_ATTR __attribute__((noinline)) uint32_t t5_run(T5_ARGS) { return s_nb ? t5_body<false, false, true, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<false, false, false, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_samp(T5_ARGS) { return t5_body<false, false, true, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_prof(T5_ARGS) { return s_nb ? t5_body<false, true, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
 static IRAM_ATTR __attribute__((noinline)) uint32_t t5_all(T5_ARGS) { return s_nb ? t5_body<true, false, true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7) : t5_body<true>(mid, w, n, end, job_in_work, cur_job, ctx, out1, out7); }
@@ -1210,8 +1337,11 @@ static void t5_job(const JobRequest &job, JobResult &result, volatile uint8_t &c
   const bool samp = false;
   (void)s_jn;
 #endif
+  const uint32_t rc0 = CCOUNT();
   result.nonce_count = (samp ? t5_samp : t5_run)(mid, w, job.nonce_start, job.nonce_start + job.nonce_count,
                               job.id & 0xFF, &cur_job, &c, nullptr, nullptr);
+  s_run_cyc += CCOUNT() - rc0;
+  s_run_n += result.nonce_count;
   if (nbr)
   {
     static uint32_t frac = 0;
@@ -1309,6 +1439,67 @@ static void t5_recal()
   s_recal_n++;
 }
 
+//v52: the feed path end to end: first hashes from turbo_sw_first_asm, phase B on the
+//engine exactly as while mining (split burst, NB, waits), every H7 vs the reference.
+//Runs on the HW core before core 1 may feed. 1 = passed, 2 + k = entry k wrong
+static uint32_t t5_feed_selftest()
+{
+  uint8_t hdr[80], ref[32];
+  uint32_t bake[TURBO_SW_BAKE_WORDS];
+  static uint32_t out7[FEED_MAX];
+  turbo_sw_kat_bake(hdr, bake);
+  const uint32_t N = 40;
+  g_feed_on = 0;
+  g_feed_head = g_feed_tail = 0;
+  for (uint32_t k = 0; k < N; ++k)
+  {
+    g_feed[k].nonce = 0x01000193u * k + 77;
+    g_feed[k].tag = 0x5A;
+    turbo_sw_first_asm(bake, g_feed[k].nonce, g_feed[k].d);
+  }
+  g_feed_head = N;
+  uint32_t * const rb = (uint32_t *)DR_REG_SHA_BASE;
+  volatile uint8_t cj = 0x5A;
+  Ctx c = {nullptr, hdr, false};
+  esp_sha_acquire_hardware();
+  if (s_split0) bb_split(0);
+  RST(O_MODE, SHA2_256);
+  RST(O_T(8), 0x00000080);
+  for (int i = 9; i < 15; ++i)
+    ((volatile uint32_t *)rb)[(0x80 >> 2) + i] = 0;
+  RST(O_T(15), 0x00010000);
+  MEMW();
+  const T5Cfg cfg = s_t5;
+  const uint32_t got = s_nb ? t5_feed<true>(rb, cfg, &c, 0x5A, &cj, out7) : t5_feed<false>(rb, cfg, &c, 0x5A, &cj, out7);
+  MEMW();
+  while (RLD(O_BUSY)) {}
+  if (s_split0) bb_split(1);
+  esp_sha_release_hardware();
+  g_feed_head = g_feed_tail = 0;
+  s_fd_n = 0; s_fd_pass = 0; s_fd_max = 0;
+  if (got != N) return 2 + 100 + got;
+  for (uint32_t k = 0; k < N; ++k)
+  {
+    turbo_ref_sha256d(hdr, g_feed[k].nonce, ref);
+    uint32_t w7;
+    memcpy(&w7, ref + 28, 4);
+    if (w7 != out7[k]) return 2 + k;
+  }
+  return 1;
+}
+
+int turbo_feed_cmd(int want, uint32_t mn, uint32_t mx, int flags, char *buf, size_t len)
+{
+  if (want >= 0) s_fd_want = want ? 1 : 0;
+  if (mx) s_fd_maxn = mx > FEED_MAX ? FEED_MAX : mx;
+  if (mn) s_fd_minn = mn > s_fd_maxn ? s_fd_maxn : mn;
+  if (flags >= 0) s_fd_flags = flags;
+  return snprintf(buf, len, "feed want %u ok %u on %u made %u n %u cand %u fc %u drop %u pass %u max %u min %u maxn %u flags %u",
+                  (unsigned)s_fd_want, (unsigned)s_fd_ok, (unsigned)g_feed_on, (unsigned)g_fd_made, (unsigned)s_fd_n,
+                  (unsigned)s_fd_cand, (unsigned)s_fd_fc, (unsigned)s_fd_drop, (unsigned)s_fd_pass, (unsigned)s_fd_max,
+                  (unsigned)s_fd_minn, (unsigned)s_fd_maxn, (unsigned)s_fd_flags);
+}
+
 void turbo_hw_init()
 {
   crash_guard_boot();
@@ -1345,6 +1536,8 @@ void turbo_hw_init()
     {
       turbo_split_pick();
       turbo_nb_pick();
+      s_fd_ok = t5_feed_selftest();
+      Serial.printf("[MINER] feed self-test %u\n", (unsigned)s_fd_ok);
     }
 #endif
   }
@@ -1365,6 +1558,7 @@ void turbo_hw_job(const JobRequest &job, JobResult &result, volatile uint8_t &cu
     s_recal_req = 0;
     if (s_mode == MODE_T5) t5_recal();
   }
+  g_feed_on = (s_mode == MODE_T5 && s_fd_ok == 1 && s_fd_want) ? 1 : 0;
   Ctx c = {&result, job.sha_buffer, false};
   result.nonce_count = job.nonce_count;
   s_bd_chk = false;
@@ -1414,7 +1608,19 @@ const char *turbo_hw_mode_name()
   return s_mode == MODE_T5 ? "t5" : s_mode == MODE_T4 ? "t4" : s_mode == MODE_T1 ? "t1" : "stock";
 }
 
+static int turbo_hw_status0(char *buf, size_t len);
 int turbo_hw_status(char *buf, size_t len)
+{
+  int r = turbo_hw_status0(buf, len);
+  if (r > 0 && (size_t)r < len)
+    r += snprintf(buf + r, len - r, ",\"feed\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"fcyc\":[%u,%u,%u,%u,%u,%u]",
+                  (unsigned)g_feed_on, (unsigned)s_fd_ok, (unsigned)s_fd_want, (unsigned)g_fd_made, (unsigned)s_fd_n,
+                  (unsigned)s_fd_cand, (unsigned)s_fd_fc, (unsigned)s_fd_drop, (unsigned)s_fd_pass, (unsigned)s_fd_max,
+                  (unsigned)(s_fd_cyc >> 10), (unsigned)(s_run_cyc >> 10), (unsigned)s_run_n,
+                  (unsigned)s_fd_minn, (unsigned)s_fd_maxn, (unsigned)s_fd_flags);
+  return r;
+}
+static int turbo_hw_status0(char *buf, size_t len)
 {
   const uint32_t cpn = s_mode == MODE_T5 ? s_t5_cpn : s_mode == MODE_T4 ? s_t4_cpn_now : s_mode == MODE_T1 ? s_t1_cpn[0] : s_t1_cpn[1];
   return snprintf(buf, len,

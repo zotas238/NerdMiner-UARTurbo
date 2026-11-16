@@ -11,7 +11,7 @@ A fork of [NerdMiner_v2](https://github.com/BitMaker-hub/NerdMiner_v2) (v1.8.3) 
 | UARTurbo, Wi-Fi mode | 240 MHz | ~480 kH/s |
 | UARTurbo, wired mode | 240 MHz | ~553 kH/s |
 | Wired, overclocked | 300 MHz | ~692 kH/s |
-| Wired, overclocked, core voltage 30 | **320 MHz** | **~737 kH/s** |
+| Wired, overclocked, core voltage 30 | **320 MHz** | **~772 kH/s** |
 
 320 MHz runs at core voltage 30 (1.25 V, ESP-IDF's own 240 MHz value), ~37 °C, with 0 bad shares and no reboots in a 60-minute soak. The CPU drops to a lower divider for the moments it formats numbers, parses or does double math ("slow zones", below). This is solo "lottery" mining: it's for fun, not profit.
 
@@ -159,7 +159,7 @@ The relay keeps the overclock in `~/.local/state/nerd-wired/oc.json` and applies
 | 9 | 260 MHz | 48 | ~599 kH/s |
 | 10 | 280 MHz | 48 | ~645 kH/s |
 | 11 | 300 MHz | 48 | ~692 kH/s, stock voltage, about one crash a day |
-| **12** | **320 MHz** | **112** + `"vdig": 30` | **~737 kH/s, core voltage 30, ~37 °C; 60-min soak: 0 bad, 0 reboots** (see "How 320 MHz works") |
+| **12** | **320 MHz** | **112** + `"vdig": 30` | **~772 kH/s, core voltage 30, ~37 °C; 60-min soak: 0 bad, 0 reboots** (see "How 320 MHz works") |
 | 13 | 340 MHz | 112 + `"vdig": 30` | the PLL locks (forced band + VCO current 0) but the CPU crashes within seconds. Don't. |
 | 14 | 360 MHz | | the PLL never locks |
 
@@ -180,7 +180,7 @@ Go up one step at a time and watch `bad_cand`, `rejected` and the reboot count (
 
 **Safety nets** (built in, nothing to set up):
 - **RTC watchdog** (8 s, runs off the RTC slow clock, not the PLL): a hard hang causes a full chip reset, which also puts the PLL and voltage back to stock.
-- **No slow modes when wired:** there are two modes only, wired turbo (~735 kH/s at 320 MHz) and Wi-Fi (stock clock, lower hashrate). Wired, the board always runs the fastest engine (t5): after a crash it reboots straight back into it at the `oc.json` clock (the relay never steps the clock down), and a wrong engine hash costs only that nonce (counted in `bad`). If the t5 self-test fails at boot, the board retries it and then reboots.
+- **No slow modes when wired:** there are two modes only, wired turbo (~772 kH/s at 320 MHz) and Wi-Fi (stock clock, lower hashrate). Wired, the board always runs the fastest engine (t5): after a crash it reboots straight back into it at the `oc.json` clock (the relay never steps the clock down), and a wrong engine hash costs only that nonce (counted in `bad`). If the t5 self-test fails at boot, the board retries it and then reboots.
 - **Relay takes the port back:** whenever the relay reopens the serial port (after `wireota.py`, `screenshot.py` or esptool) it re-applies the overclock 30 s later, so a reboot it didn't see can't leave the board on stock clock.
 - **Self-tests:** every fast SHA path is checked against mbedTLS at boot and spot-checked while mining (`bad` / `sw_bad` in status must stay 0). In Wi-Fi mode a failing path falls back to a slower one, and two crash resets in a row put the engine in a slow safe mode (`"safe": true`, cleared by `Z`).
 - **The relay re-hashes every share**, so a wrong result never reaches the pool.
@@ -223,6 +223,8 @@ Write one per line to `<state>/cmd` (`echo S >> ~/.local/state/nerd-wired/cmd`).
 | `W <s>` | screen redraw period in seconds (default 12, `0` = frozen). Status `"redraw"`: [period, last µs, max µs, count] |
 | `L <h> <h>` | block height for the screen (the relay sends it from the job's coinbase, BIP34, when it changes) |
 | `M <d> <d>` | set the best-ever share difficulty shown on the screen (value twice, both must match) |
+| `w <wa> <wb> <wl> <wn>` | set the t5 cycle waits live while mining (`0` keeps one); replies `w` with the values in use |
+| `f [on] [min] [max] [flags]` | core-1 feed (on by default): `f 0` / `f 1` turns it off / on, no argument shows its counters. Status `"fcyc"`: feed accounting |
 | `F` | screenshot: use `wired/tools/screenshot.py out.png` (drops to stock clock for the read-back, restores the overclock) |
 | `Y` | stream the last coredump (use `wired/tools/coredump_get.py <firmware.elf>`) |
 | `X` | dump BBPLL registers (now and at boot) |
@@ -244,7 +246,7 @@ Wire protocol (board side, `runWiredWorker` in `src/mining.cpp`): relay → boar
 | `serial open` but no `H` hello, `khs` null | TX/RX swapped, missing GND, or a bad joint on GPIO43 → host RX. Is the console/getty still on that UART? Did the first flash succeed? |
 | Hello OK, but no shares | Check `authorized True` (address/pool), and that the pool's difficulty isn't huge (`pool diff` lines in the log). |
 | `bad_cand` > 0, `rejected` climbing, frequent `boots` | Overclock too high for your chip: lower `div` (or at 320 MHz raise `vdig` to 30), or add/remove mode bit 4 per the table. |
-| ~715 kH/s at 320 MHz instead of ~737, `t5.sb` code 5 | The board crashed once and runs this boot without the split-burst speed-up (the crash guard). If it was a one-off, `R` reboots it back to full speed. |
+| ~750 kH/s at 320 MHz instead of ~772, `t5.sb` code 5 | The board crashed once and runs this boot without the split-burst speed-up (the crash guard). If it was a one-off, `R` reboots it back to full speed. |
 | A few `rejected` with `Job not found` | The share was for a job the pool had already dropped (stale). Normal, not the overclock: the relay re-hashed it. |
 | Hashrate ~275 kH/s, `"safe": true` (Wi-Fi mode only) | Crash guard tripped: fix the cause, then `Z`. |
 | Board dead / boot loop / anything else | **USB recovery:** hold BOOT, plug USB into a computer, and do the first-flash steps again. The ROM bootloader lives in mask ROM, so it can always be reached this way. |
@@ -254,12 +256,13 @@ Wire protocol (board side, `runWiredWorker` in `src/mining.cpp`): relay → boar
 
 ## How the speed-up works (short version)
 
-- **HW miner** (≈ 92 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits, and moves digests with PIE 128-bit loads/stores: ~455 CPU cycles per nonce, against ~1200 in stock NerdMiner. Most of those cycles are the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word). Two wired-mode tricks cut that:
+- **HW miner** (≈ 85 % of the hashrate): drives the S3's SHA accelerator with raw register stores, batches 128 nonces (first blocks for all, then the second hashes), replaces BUSY polling with calibrated cycle-count waits, and moves digests with PIE 128-bit loads/stores: ~455 CPU cycles per nonce (~454 measured at 320 MHz), against ~1200 in stock NerdMiner. Most of those cycles are the CPU talking to the SHA registers over the peripheral bus (~16 cycles per word). Two wired-mode tricks cut that:
   - **Split burst off:** the S3 splits 128-bit accesses to peripherals into single transfers by default (`SENSITIVE_APB_PERIPHERAL_ACCESS_SPLIT_BURST`). Clearing it around the mining loop saves ~13%. It is used only if 4096 nonces match mbedTLS with it and it benches faster at boot; status `t5.sb` = [cycles ×10 with it, without it, code: 1 used, 2 last trial hung, 3 self-test failed, 4 not faster, 5 off after a crash].
   - **No anchor on the second hash:** the second hash of each nonce after the first in a batch starts without an anchor load, with interrupts masked around the START store and the wait timed from its issue (~1%). The H7 read is occasionally early (~0.7% of those nonces): such a nonce is lost, and a false candidate from it is counted in `t5.nb[9]` against `t5.nb[10]` (those nonces / 65536), not as an engine fault. It switches itself off if the loss passes 1%.
 
   Every variant is self-tested against mbedTLS at boot and the fastest passing one is picked; every 8th job is spot-checked against mbedTLS while mining.
-- **SW miner** on the other core: double SHA-256 in generated, list-scheduled Xtensa assembly with schedule/round precompute: ~5450 cycles per nonce.
+- **SW miner / feed** on the other core: double SHA-256 in generated, list-scheduled Xtensa assembly with schedule/round precompute: ~5450 cycles per nonce. In wired mode (t5) core 1 instead **feeds** the HW core: it computes only the first hash of each nonce (~2880 cycles) into a ring, and the HW core finishes the second hash on the engine for ~160 cycles each, between its own batches. That trades ~6% of the HW core's own rate for twice the core-1 contribution: ~660 + ~112 kH/s, against ~701 + ~58 without it (`f 0`).
+- **Bumps:** if a mining spot-check fails, it is re-run once; only a repeat failure counts, and it raises the wait of the failing phase only (status `t5.bd`).
 - **Wired:** stratum moves off the chip, the UART goes onto the crystal, and the BBPLL feedback divider is reprogrammed at run time following ESP-IDF's own PLL sequence (MSPI to low speed, CPU on the crystal, recalibrate, wait for lock, gentle return). That's in `src/turbo/turbo_pll.cpp`. The hashrate scales with the **PLL**, not just the CPU divider: the peripheral bus is clocked from the PLL independently of the CPU divider, and most of the miner's cycles are bus traffic. At 320 MHz, slow zones keep the code that formats, parses and does double math at PLL/3 while the SHA loops run at PLL/2, and wired mode keeps the heap out of PSRAM (see "How 320 MHz works").
 
 Main files: `src/turbo/turbo_hw.cpp` (HW engine), `src/turbo/sha256_sw*.{cpp,S,inc}` + `gen_sw_asm.py` (SW miner), `src/turbo/turbo_pll.cpp` (overclock), `src/mining.cpp` → `runWiredWorker` (wire protocol), `wired/` (relay and tools).
